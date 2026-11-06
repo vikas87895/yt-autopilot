@@ -1,0 +1,30 @@
+<!doctype html><html lang="hi"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Channel Dashboard</title>
+<style>
+:root{--bg:#fff;--fg:#111;--card:#f2f3f7;--mut:#667;--acc:#e11d48}
+@media(prefers-color-scheme:dark){:root{--bg:#0e0f13;--fg:#eee;--card:#1b1d24;--mut:#9aa}}
+body{margin:0;padding:16px;background:var(--bg);color:var(--fg);font-family:system-ui,sans-serif}
+h1{font-size:20px;margin:0 0 4px}.mut{color:var(--mut);font-size:13px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:14px 0}
+.card{background:var(--card);border-radius:12px;padding:12px}.big{font-size:22px;font-weight:700}
+.row{display:flex;align-items:center;gap:8px;margin:8px 0;font-size:13px}
+.bar{height:8px;background:var(--acc);border-radius:4px}.t{flex:1;min-width:0}
+.t a{color:var(--fg);text-decoration:none;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+h2{font-size:15px;margin:18px 0 6px}
+</style></head><body>
+<h1>Channel Dashboard</h1><div class="mut" id="up">loading...</div>
+<div class="grid" id="cards"></div>
+<h2>Top videos (views)</h2><div id="top"></div>
+<h2>Recent auto uploads</h2><div id="hist"></div>
+<script>
+fetch('data.json?t='+Date.now()).then(r=>r.json()).then(d=>{
+ up.textContent='Updated '+d.updated;
+ const c=(a,b)=>`<div class="card"><div class="mut">${a}</div><div class="big">${b}</div></div>`;
+ cards.innerHTML=c('Total views',d.total_views)+c('Best upload time',d.best_hour+':00 IST')
+  +c('Shorts avg views/day',d.short.avg+' ('+d.short.n+' vids)')+c('Long avg views/day',d.long.avg+' ('+d.long.n+' vids)');
+ const v=[...d.videos].sort((a,b)=>b.views-a.views).slice(0,10),m=Math.max(1,...v.map(x=>x.views));
+ top.innerHTML=v.map(x=>`<div class="row"><div class="t"><a href="https://youtu.be/${x.id}">${x.short?'[S] ':''}${x.title}</a>
+ <div class="bar" style="width:${x.views/m*100}%"></div></div><div>${x.views}<br><span class="mut">&#128077;${x.likes} &#128172;${x.comments}</span></div></div>`).join('')||'<div class="mut">No public videos yet</div>';
+ hist.innerHTML=[...d.history].reverse().slice(0,10).map(h=>`<div class="row"><div class="t">${h.title}<div class="mut">${h.fmt} | ${h.topic} | ${h.when}</div></div></div>`).join('');
+}).catch(e=>up.textContent='No data yet. Run the workflow once.');
+</script></body></html>
