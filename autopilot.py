@@ -1,6 +1,6 @@
 """yt-autopilot v2: trending topic -> story script -> Gemini images (consistent characters)
 -> multi-voice TTS -> music + sfx -> Ken Burns video -> thumbnail -> scheduled upload -> dashboard data."""
-import os, io, re, sys, json, time, base64, random, wave, asyncio, subprocess, traceback, datetime as dt
+import os, io, re, sys, glob, json, time, base64, random, wave, asyncio, subprocess, traceback, datetime as dt
 import requests, numpy as np
 import edge_tts
 from PIL import Image, ImageDraw, ImageFont, ImageEnhance, ImageFilter
@@ -9,6 +9,10 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from googleapiclient.errors import HttpError
 
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
 LANG = os.getenv("CONTENT_LANG") or "hi"
 REVIEW = (os.getenv("REVIEW_MODE") or "false").lower() == "true"
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
@@ -143,21 +147,48 @@ def gemini_image(prompt, refs, aspect):
     return None
 
 
-def fallback_image(prompt, w, h, i):
+def pollinations_image(prompt, w, h):
     try:
         r = requests.get("https://image.pollinations.ai/prompt/" + requests.utils.quote(prompt[:400]),
-                         params={"width": w, "height": h, "nologo": "true", "seed": random.randint(1, 99999)}, timeout=120)
+                         params={"width": w, "height": h, "nologo": "true", "model": "flux",
+                                 "seed": random.randint(1, 99999)}, timeout=120)
         if r.ok and r.headers.get("content-type", "").startswith("image"):
             return Image.open(io.BytesIO(r.content)).convert("RGB")
-    except Exception:
-        pass
-    img = Image.new("RGB", (w, h))
-    d = ImageDraw.Draw(img)
-    c1, c2 = [(30, 20, 60), (10, 50, 80), (60, 20, 40), (15, 60, 50)][i % 4], (5, 5, 15)
-    for y in range(h):
-        k = y / h
-        d.line([(0, y), (w, y)], fill=tuple(int(c1[j] * (1 - k) + c2[j] * k) for j in range(3)))
-    return img
+    except Exception as e:
+        print("pollinations error:", e)
+    return None
+
+
+CF_DEAD = False
+
+
+def cloudflare_image(prompt, w, h):
+    """Free: Cloudflare Workers AI FLUX-1-schnell (10,000 neurons/day)."""
+    global CF_DEAD
+    acc, tok = os.getenv("CF_ACCOUNT_ID"), os.getenv("CF_API_TOKEN")
+    if CF_DEAD or not (acc and tok):
+        return None
+    url = f"https://api.cloudflare.com/client/v4/accounts/{acc}/ai/run/@cf/black-forest-labs/flux-1-schnell"
+    for attempt in range(3):
+        body = {"prompt": prompt[:1900], "steps": 6}
+        if attempt == 0:
+            body.update(width=w, height=h)  # some models reject custom size -> retried without
+        try:
+            r = requests.post(url, headers={"Authorization": f"Bearer {tok}"}, json=body, timeout=150)
+        except Exception as e:
+            print("cloudflare error:", e); time.sleep(8); continue
+        if r.status_code == 200:
+            b64 = (r.json().get("result") or {}).get("image")
+            if b64:
+                return Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
+            return None
+        print("cloudflare", r.status_code, r.text[:200])
+        if r.status_code in (401, 403):
+            CF_DEAD = True
+            return None
+        if r.status_code == 429:
+            time.sleep(20)
+    return None
 
 
 # ---------------------------------------------------------------- analytics
@@ -296,37 +327,131 @@ Return JSON with keys: title, description, tags, thumb_text, style, music_mood, 
 def make_images(s, fmt, work):
     short = fmt == "short"
     W, H = (720, 1280) if short else (1280, 720)
+    gw, gh = (576, 1024) if short else (1024, 576)  # generation size (FLUX likes multiples of 64)
     aspect = "9:16" if short else "16:9"
-    style, refs = s["style"], {}
-    for c in s.get("characters", [])[:4]:
-        r = gemini_image(f"{style}. Character reference portrait of {c['name']}: {c['look']}. "
-                         "Full body, plain neutral background, no text, no watermark.", [], "1:1")
-        if r:
-            refs[c["id"]] = r
-        time.sleep(4)
-    paths = []
+    style = s["style"]
+    chars = {c["id"]: c for c in s.get("characters", [])}
+    refs = {}
+    n = len(s["scenes"])
+    imgs = [None] * n
+    use_gemini_refs = False
+    if not (os.getenv("CF_ACCOUNT_ID") and os.getenv("CF_API_TOKEN")):
+        print("NOTE: CF_ACCOUNT_ID / CF_API_TOKEN not set -> only paid Gemini or low-quality fallback will work")
     for i, sc in enumerate(s["scenes"]):
-        rf = [refs[c] for c in sc.get("characters", []) if c in refs][:3]
-        prompt = (f"{style}. {sc['image_prompt']}. " + ("Characters must look exactly like the reference images. " if rf else "")
-                  + "No text, no captions, no watermark, no logo.")
-        r = gemini_image(prompt, rf, aspect)
-        time.sleep(4)
-        img = Image.open(io.BytesIO(base64.b64decode(r[1]))).convert("RGB") if r else fallback_image(prompt, W, H, i)
+        who = [chars[c] for c in sc.get("characters", []) if c in chars]
+        look = " ".join(f"{c['name']} is {c['look']}." for c in who)
+        prompt = (f"{style}. {sc['image_prompt']}. {look} Highly detailed, sharp focus, professional quality, "
+                  f"rich colors, cinematic composition. No text, no captions, no watermark, no logo.")
+        img, src = cloudflare_image(prompt, gw, gh), "cloudflare"
+        if img is None:
+            r = gemini_image(prompt, [], aspect)
+            if r:
+                img, src = Image.open(io.BytesIO(base64.b64decode(r[1]))).convert("RGB"), "gemini"
+        if img is None:
+            img, src = pollinations_image(prompt, gw, gh), "pollinations"
+        print(f"scene {i + 1}/{n}: {'OK via ' + src if img else 'FAILED'}")
+        imgs[i] = img
+    good = [i for i, im in enumerate(imgs) if im is not None]
+    if not good:
+        raise RuntimeError("Koi image nahi ban payi. Cloudflare keys (CF_ACCOUNT_ID, CF_API_TOKEN) check karo.")
+    if len(good) < 0.6 * n:
+        raise RuntimeError(f"Sirf {len(good)}/{n} images bani. Kharab video upload nahi kiya.")
+    for i in range(n):  # fill gaps with nearest good image instead of a black card
+        if imgs[i] is None:
+            j = min(good, key=lambda g: abs(g - i))
+            imgs[i] = imgs[j]
+    paths = []
+    for i, im in enumerate(imgs):
         p = f"img{i}.jpg"
-        img.save(os.path.join(work, p), quality=92)
+        im.save(os.path.join(work, p), quality=95)
         paths.append(p)
     return paths
 
 
 # ---------------------------------------------------------------- voices
 VOICES = {
-    "hi": {"narrator": ("hi-IN-MadhurNeural", "+0Hz", "+0%"), "male": ("hi-IN-MadhurNeural", "-8Hz", "+3%"),
-           "female": ("hi-IN-SwaraNeural", "+0Hz", "+0%"), "child": ("hi-IN-SwaraNeural", "+55Hz", "+12%"),
+    "hi": {"narrator": ("hi-IN-MadhurNeural", "+0Hz", "-3%"), "male": ("hi-IN-MadhurNeural", "-8Hz", "+0%"),
+           "female": ("hi-IN-SwaraNeural", "+0Hz", "-3%"), "child": ("hi-IN-SwaraNeural", "+55Hz", "+10%"),
            "old": ("hi-IN-MadhurNeural", "-25Hz", "-12%")},
-    "en": {"narrator": ("en-IN-PrabhatNeural", "+0Hz", "+0%"), "male": ("en-IN-PrabhatNeural", "-8Hz", "+3%"),
-           "female": ("en-IN-NeerjaNeural", "+0Hz", "+0%"), "child": ("en-IN-NeerjaNeural", "+55Hz", "+12%"),
+    "en": {"narrator": ("en-IN-PrabhatNeural", "+0Hz", "-3%"), "male": ("en-IN-PrabhatNeural", "-8Hz", "+0%"),
+           "female": ("en-IN-NeerjaNeural", "+0Hz", "-3%"), "child": ("en-IN-NeerjaNeural", "+55Hz", "+10%"),
            "old": ("en-IN-PrabhatNeural", "-25Hz", "-12%")},
 }
+# Gemini TTS (natural, expressive). Free tier is slow (~3 requests/min), so we pace calls.
+GVOICE = {
+    "narrator": ("Charon", "warm, engaging storyteller, natural conversational pace, clear pronunciation"),
+    "male": ("Puck", "friendly, expressive, natural"),
+    "female": ("Kore", "warm, expressive, natural"),
+    "child": ("Leda", "playful child-like voice, high energy, youthful"),
+    "old": ("Gacrux", "calm, mature, slow and wise"),
+}
+TTS_PREF = ["gemini-3.8-flash-tts", "gemini-3.8-flash-lite-tts", "gemini-3.1-flash-tts-preview", "gemini-2.5-flash-preview-tts"]
+_TTS = None
+_TTS_LAST = [0.0]
+TTS_DEAD = False
+
+
+def gemini_tts(text, kind, out_wav, work):
+    """Writes a 24k mono wav (with 0.22s tail) and returns True, or False if Gemini TTS is unavailable."""
+    global _TTS, TTS_DEAD
+    if TTS_DEAD or (os.getenv("USE_GEMINI_TTS") or "true").lower() == "false":
+        return False
+    if _TTS is None:
+        av = available_models()
+        _TTS = [m for m in TTS_PREF if m in av] + [m for m in av if "tts" in m and m not in TTS_PREF]
+        if not av:
+            _TTS = TTS_PREF[:2]
+        print("tts models to try:", _TTS)
+    voice, style = GVOICE.get(kind, GVOICE["narrator"])
+    for model in list(_TTS):
+        new = "3.8" in model
+        for attempt in range(3):
+            wait = 21 - (time.time() - _TTS_LAST[0])
+            if wait > 0:
+                time.sleep(wait)
+            _TTS_LAST[0] = time.time()
+            if new:
+                part = {"text": text}
+                if attempt != 1:
+                    part["speech_metadata"] = {"style": style}
+                vc = {"voice": voice}
+            else:
+                part = {"text": f"Say in a {style} tone: {text}"}
+                vc = {"prebuiltVoiceConfig": {"voiceName": voice}}
+            body = {"contents": [{"role": "user", "parts": [part]}],
+                    "generationConfig": {"responseModalities": ["AUDIO"], "speechConfig": {"voiceConfig": vc}}}
+            try:
+                r = requests.post(GEM + model + ":generateContent", params={"key": os.environ["GEMINI_API_KEY"]},
+                                  json=body, timeout=180)
+            except Exception as e:
+                print("tts error", e); continue
+            if r.status_code == 200:
+                try:
+                    d = r.json()["candidates"][0]["content"]["parts"][0]
+                    d = d.get("inlineData") or d.get("inline_data")
+                    raw = base64.b64decode(d["data"])
+                except Exception:
+                    break
+                src = os.path.join(work, "tts_raw.wav")
+                if raw[:4] == b"RIFF":
+                    open(src, "wb").write(raw)
+                else:  # headerless 16-bit PCM, 24 kHz mono
+                    with wave.open(src, "wb") as w:
+                        w.setnchannels(1); w.setsampwidth(2); w.setframerate(SR); w.writeframes(raw)
+                run(["ffmpeg", "-y", "-i", "tts_raw.wav", "-ar", str(SR), "-ac", "1", "-sample_fmt", "s16",
+                     "-af", "apad=pad_dur=0.22", os.path.basename(out_wav)], work)
+                return True
+            print("tts", model, r.status_code, r.text[:160])
+            if r.status_code == 429 and "limit: 0" not in r.text and "per day" not in r.text.lower():
+                time.sleep(30); continue
+            if r.status_code == 400 and attempt == 0:
+                continue
+            if r.status_code in (400, 403, 404, 429):
+                _TTS.remove(model)
+                break
+    if not _TTS:
+        TTS_DEAD = True
+    return False
 
 
 async def _tts(text, v, path):
@@ -349,23 +474,52 @@ def _ts(t):
     return f"{int(t // 3600):02d}:{int(t % 3600 // 60):02d}:{t % 60:06.3f}".replace(".", ",")
 
 
+def approx_words(text, d):
+    ws = text.split()
+    if not ws:
+        return []
+    tot = sum(len(w) + 1 for w in ws)
+    t, out = 0.05, []
+    for w in ws:
+        x = (d - 0.1) * (len(w) + 1) / tot
+        out.append((t, x, w)); t += x
+    return out
+
+
 def make_voice(s, work, chunk):
     kinds = {c["id"]: c.get("voice", "male") for c in s.get("characters", [])}
     vmap = VOICES.get(LANG, VOICES["hi"])
     cursor, wavs, caps, times = 0.0, [], [], []
+    n_tts = 0
     for si, sc in enumerate(s["scenes"]):
         start = cursor
-        for li, ln in enumerate(sc["lines"]):
-            kind = "narrator" if ln["speaker"] == "narrator" else kinds.get(ln["speaker"], "male")
-            mp3, wav = f"l{si}_{li}.mp3", f"l{si}_{li}.wav"
-            words = asyncio.run(_tts(ln["text"], vmap.get(kind, vmap["narrator"]), os.path.join(work, mp3)))
-            run(["ffmpeg", "-y", "-i", mp3, "-ar", str(SR), "-ac", "1", "-sample_fmt", "s16",
-                 "-af", "apad=pad_dur=0.22", wav], work)
+        groups = []  # merge neighbouring lines of the same speaker -> fewer TTS requests
+        for ln in sc["lines"]:
+            if groups and groups[-1][0] == ln["speaker"]:
+                groups[-1][1].append(ln["text"])
+            else:
+                groups.append([ln["speaker"], [ln["text"]]])
+        for li, (sp, texts) in enumerate(groups):
+            text = " ".join(texts)
+            kind = "narrator" if sp == "narrator" else kinds.get(sp, "male")
+            wav = f"l{si}_{li}.wav"
+            words = None
+            if gemini_tts(text, kind, os.path.join(work, wav), work):
+                n_tts += 1
+                words = None
+            else:
+                mp3 = f"l{si}_{li}.mp3"
+                words = asyncio.run(_tts(text, vmap.get(kind, vmap["narrator"]), os.path.join(work, mp3)))
+                run(["ffmpeg", "-y", "-i", mp3, "-ar", str(SR), "-ac", "1", "-sample_fmt", "s16",
+                     "-af", "apad=pad_dur=0.22", wav], work)
             d = dur(os.path.join(work, wav))
+            if words is None:
+                words = approx_words(text, d - 0.22)
             caps += [(cursor + w[0], cursor + w[0] + w[1], w[2]) for w in words]
             cursor += d
             wavs.append(os.path.join(work, wav))
         times.append((start, cursor))
+        print(f"voice scene {si + 1}/{len(s['scenes'])} done ({'gemini' if n_tts else 'edge'} so far)")
     with wave.open(os.path.join(work, "voice.wav"), "wb") as out:
         out.setnchannels(1); out.setsampwidth(2); out.setframerate(SR)
         for w in wavs:
@@ -409,25 +563,71 @@ CHORDS = {"calm": [220, 277.2, 329.6], "happy": [261.6, 329.6, 392], "sad": [220
 
 
 def pad(mood, total):
-    x = np.arange(int(total * SR)) / SR
-    m = np.zeros_like(x)
-    for i, f in enumerate(CHORDS.get(mood, CHORDS["calm"])):
+    """Fallback music: soft pad + gentle arpeggio + echo (used only if no music/ tracks are uploaded)."""
+    n = int(total * SR)
+    x = np.arange(n) / SR
+    chord = CHORDS.get(mood, CHORDS["calm"])
+    m = np.zeros(n)
+    for i, f in enumerate(chord):
         lfo = 0.6 + 0.4 * np.sin(2 * np.pi * (0.07 + 0.03 * i) * x + i)
         m += (np.sin(2 * np.pi * f * x) + 0.3 * np.sin(2 * np.pi * 2 * f * x)) * lfo
     m /= max(1e-6, np.abs(m).max())
+    bpm = {"calm": 72, "happy": 108, "sad": 60, "tense": 92, "epic": 84}.get(mood, 80)
+    step = 60 / bpm / 2
+    seq = [f * 2 for f in chord] + [f * 4 for f in chord[::-1]]
+    arp = np.zeros(n)
+    tt = np.arange(int(1.6 * SR)) / SR
+    t0, i = 0.0, 0
+    while t0 < total - 1:
+        f = seq[i % len(seq)]
+        note = (np.sin(2 * np.pi * f * tt) + 0.4 * np.sin(2 * np.pi * 2 * f * tt) * np.exp(-tt * 5)) * np.exp(-tt * 3.2)
+        st = int(t0 * SR)
+        arp[st:st + len(note)] += note[:n - st]
+        t0 += step; i += 1
+    arp /= max(1e-6, np.abs(arp).max())
+    mix = m * 0.6 + arp * 0.45
+    for dly, g in ((int(0.375 * SR), 0.35), (int(0.75 * SR), 0.18)):
+        mix[dly:] += g * mix[:-dly].copy()
+    mix /= max(1e-6, np.abs(mix).max())
     fade = np.minimum(1, np.minimum(x / 2, (total - x) / 2))
-    return m * fade
+    return mix * fade
+
+
+def user_music(mood, total, work):
+    """Real tracks the owner uploaded to the music/ folder (name them like calm_1.mp3, happy_2.mp3 ...)."""
+    files = [f for f in glob.glob("music/*") if f.lower().endswith((".mp3", ".wav", ".m4a", ".ogg", ".aac"))]
+    if not files:
+        return None
+    pick = [f for f in files if mood in os.path.basename(f).lower()] or files
+    f = random.choice(pick)
+    out = os.path.join(work, "music.wav")
+    try:
+        run(["ffmpeg", "-y", "-stream_loop", "-1", "-i", os.path.abspath(f), "-t", f"{total:.2f}", "-ar", str(SR),
+             "-ac", "1", "-sample_fmt", "s16", "-af", f"afade=t=in:d=2,afade=t=out:st={max(0, total - 3):.2f}:d=3", out])
+        x = read_wav(out)
+        print("music track:", os.path.basename(f))
+        return x / max(1e-6, np.abs(x).max())
+    except Exception as e:
+        print("music file failed:", e)
+        return None
 
 
 def mix_audio(s, times, work):
     voice = read_wav(os.path.join(work, "voice.wav"))
     total = len(voice) / SR + 0.6
     voice = np.pad(voice, (0, int(total * SR) - len(voice)))
+    voice /= max(1e-6, np.abs(voice).max()) / 0.8  # even loudness whatever the TTS returned
     k = int(0.25 * SR)
     cs = np.cumsum(np.insert(np.abs(voice), 0, 0))
     env = np.pad((cs[k:] - cs[:-k]) / k, (k // 2, len(voice) - (len(cs) - k) - k // 2))[:len(voice)]
     duck = 1 - 0.7 * np.clip(env * 12, 0, 1)
-    bed = pad(s.get("music_mood", "calm"), total)[:len(voice)] * 0.16 * duck
+    mood = s.get("music_mood", "calm")
+    track = user_music(mood, total, work)
+    real = track is not None
+    if track is None:
+        track = pad(mood, total)
+    track = np.pad(track, (0, max(0, len(voice) - len(track))))[:len(voice)]
+    bed = track * (0.20 if real else 0.12) * duck
     fx = np.zeros(len(voice))
     for i, (a, _) in enumerate(times):
         for kind, off in (("whoosh", -0.15 if i else None), (s["scenes"][i].get("sfx", "none"), 0.05)):
@@ -438,7 +638,7 @@ def mix_audio(s, times, work):
                 continue
             st = max(0, int((a + off) * SR))
             fx[st:st + len(snd)] += snd[:len(fx) - st]
-    mix = voice + bed + fx * 0.35
+    mix = voice + bed + fx * 0.30
     mix /= max(1.0, np.abs(mix).max() / 0.95)
     write_wav(os.path.join(work, "mix.wav"), mix)
 
