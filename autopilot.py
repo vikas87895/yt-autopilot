@@ -1,6 +1,6 @@
 """yt-autopilot v2: trending topic -> story script -> Gemini images (consistent characters)
 -> multi-voice TTS -> music + sfx -> Ken Burns video -> thumbnail -> scheduled upload -> dashboard data."""
-import os, io, re, json, time, base64, random, wave, asyncio, subprocess, datetime as dt
+import os, io, re, sys, json, time, base64, random, wave, asyncio, subprocess, traceback, datetime as dt
 import requests, numpy as np
 import edge_tts
 from PIL import Image, ImageDraw, ImageFont, ImageEnhance, ImageFilter
@@ -103,8 +103,11 @@ def fallback_image(prompt, w, h, i):
 
 # ---------------------------------------------------------------- analytics
 def _secs(iso):
-    h, m, s = [int(x or 0) for x in re.match(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", iso).groups()]
-    return h * 3600 + m * 60 + s
+    m = re.match(r"P(?:(\d+)D)?T?(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", iso or "")
+    if not m:
+        return 0
+    d, h, mi, s = [int(x or 0) for x in m.groups()]
+    return d * 86400 + h * 3600 + mi * 60 + s
 
 
 def own_videos(yt, n=50):
@@ -125,7 +128,7 @@ def own_videos(yt, n=50):
         out.append(dict(id=v["id"], title=v["snippet"]["title"], views=int(st.get("viewCount", 0)),
                         likes=int(st.get("likeCount", 0)), comments=int(st.get("commentCount", 0)),
                         age_days=(now - pub).days, hour=pub.astimezone(IST).hour,
-                        short=_secs(v["contentDetails"]["duration"]) <= 180))
+                        short=0 < _secs(v["contentDetails"].get("duration")) <= 180))
     return out
 
 
@@ -158,11 +161,12 @@ def choose_format(stats):
     return worse if random.random() < 0.25 else best
 
 
-def next_slot(hour):
+def next_slot(hour, extra_hours=0):
     now = dt.datetime.now(IST)
     t = now.replace(hour=hour, minute=0, second=0, microsecond=0)
     if t < now + dt.timedelta(minutes=45):
         t += dt.timedelta(days=1)
+    t += dt.timedelta(hours=extra_hours)
     return t.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
@@ -473,29 +477,46 @@ def upload(yt, video, thumb, s, publish_at):
 
 
 # ---------------------------------------------------------------- main
-def main():
-    yt = youtube()
-    hist = json.load(open("history.json")) if os.path.exists("history.json") else []
-    stats = analyze(yt)
-    write_dashboard(stats, hist)
-    fmt = os.getenv("FORCE_FORMAT") or choose_format(stats)
-    print("Format:", fmt, "| best hour IST:", stats["best_hour"])
+def make_one(yt, hist, stats, fmt, idx):
+    print(f"=== Video {idx + 1}: {fmt} | best hour IST: {stats['best_hour']}")
     t = pick_topic(yt, stats, fmt, hist)
     print("Topic:", t)
     s = write_script(t, fmt)
-    work = "work"
+    work = f"work_{fmt}"
     os.makedirs(work, exist_ok=True)
     imgs = make_images(s, fmt, work)
     times, has_caps = make_voice(s, work, 3 if fmt == "short" else 5)
     mix_audio(s, times, work)
     video = render(s, fmt, work, imgs, times, has_caps)
     thumb = make_thumb(os.path.join(work, imgs[0]), s["thumb_text"], os.path.join(work, "thumb.jpg"))
-    slot = None if REVIEW else next_slot(stats["best_hour"])
+    slot = None if REVIEW else next_slot(stats["best_hour"], 3 * idx)
     vid = upload(yt, video, thumb, s, slot)
     print("Uploaded:", vid, "scheduled:", slot)
     hist.append(dict(date=dt.date.today().isoformat(), topic=t["topic"], title=s["title"], fmt=fmt, id=vid, when=slot or "private"))
     json.dump(hist, open("history.json", "w"), ensure_ascii=False, indent=1)
     write_dashboard(stats, hist)
+
+
+def main():
+    yt = youtube()
+    hist = json.load(open("history.json")) if os.path.exists("history.json") else []
+    stats = analyze(yt)
+    write_dashboard(stats, hist)
+    if (os.getenv("RUN_BOTH") or "").lower() == "true" or os.path.exists("run_both.txt"):
+        plan = ["short", "long"]  # test mode: short first (quick check), then long
+    else:
+        plan = [os.getenv("FORCE_FORMAT") or choose_format(stats)]
+    errors = 0
+    for i, fmt in enumerate(plan):
+        try:
+            make_one(yt, hist, stats, fmt, i)
+        except Exception:
+            errors += 1
+            traceback.print_exc()
+    if not os.path.exists("history.json"):
+        json.dump(hist, open("history.json", "w"))
+    if errors:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
