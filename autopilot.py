@@ -11,12 +11,9 @@ from googleapiclient.errors import HttpError
 
 LANG = os.getenv("CONTENT_LANG") or "hi"
 REVIEW = (os.getenv("REVIEW_MODE") or "false").lower() == "true"
-GEM_TEXT = os.getenv("GEMINI_MODEL") or "gemini-2.5-flash"
-GEM_IMG = os.getenv("GEMINI_IMAGE_MODEL") or "gemini-2.5-flash-image"
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 SR = 24000
 GEM = "https://generativelanguage.googleapis.com/v1beta/models/"
-IMG_OK = True  # flips to False if Gemini image quota is 0 for this key
 
 
 # ---------------------------------------------------------------- helpers
@@ -40,47 +37,109 @@ def youtube():
     return build("youtube", "v3", credentials=creds)
 
 
+_AV = None
+
+
+def available_models():
+    """Models this API key can call with generateContent (names change often, so ask Google)."""
+    global _AV
+    if _AV is None:
+        _AV = []
+        try:
+            tok = None
+            while True:
+                params = {"key": os.environ["GEMINI_API_KEY"], "pageSize": 200}
+                if tok:
+                    params["pageToken"] = tok
+                r = requests.get(GEM.rstrip("/"), params=params, timeout=60).json()
+                for m in r.get("models", []):
+                    if "generateContent" in m.get("supportedGenerationMethods", []):
+                        _AV.append(m["name"].split("/")[-1])
+                tok = r.get("nextPageToken")
+                if not tok:
+                    break
+        except Exception as e:
+            print("model list failed:", e)
+        print("Available models:", [m for m in _AV if "flash" in m or "image" in m or "pro" in m][:40])
+    return _AV
+
+
+TEXT_PREF = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite",
+             "gemini-3.1-flash-lite", "gemini-3-flash-preview", "gemini-flash-latest",
+             "gemini-2.5-flash", "gemini-2.5-flash-lite"]
+IMG_PREF = ["gemini-3.1-flash-image", "gemini-3.1-flash-image-preview", "gemini-2.5-flash-image", "gemini-3-pro-image"]
+
+
+def text_models():
+    av = available_models()
+    c = [os.getenv("GEMINI_MODEL")] if os.getenv("GEMINI_MODEL") else []
+    c += [m for m in TEXT_PREF if m in av or not av]
+    c += [m for m in av if re.fullmatch(r"gemini-[\d.]+-flash(-lite)?", m) and m not in c]
+    return c
+
+
 def gemini_json(prompt, temperature=0.8):
     body = {"contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"responseMimeType": "application/json", "temperature": temperature}}
     last = None
-    for i in range(4):
-        try:
-            r = requests.post(GEM + GEM_TEXT + ":generateContent", params={"key": os.environ["GEMINI_API_KEY"]},
-                              json=body, timeout=180)
-            r.raise_for_status()
-            return json.loads(r.json()["candidates"][0]["content"]["parts"][0]["text"])
-        except Exception as e:
-            last = e
-            time.sleep(6 * (i + 1))
-    raise RuntimeError(f"Gemini text failed: {last}")
+    for model in text_models():
+        for i in range(2):
+            try:
+                r = requests.post(GEM + model + ":generateContent", params={"key": os.environ["GEMINI_API_KEY"]},
+                                  json=body, timeout=180)
+                if r.status_code in (400, 403, 404, 429):
+                    last = f"{model}: {r.status_code} {r.text[:150]}"
+                    print("text model skipped ->", last)
+                    break
+                r.raise_for_status()
+                parts = r.json()["candidates"][0]["content"]["parts"]
+                txt = "".join(p.get("text", "") for p in parts if not p.get("thought"))
+                print("text model used:", model)
+                return json.loads(txt)
+            except Exception as e:
+                last = f"{model}: {e}"
+                time.sleep(6)
+    raise RuntimeError(f"Gemini text failed on every model. Last: {last}")
+
+
+IMG_MODELS = None
 
 
 def gemini_image(prompt, refs, aspect):
-    """Returns (mime, base64) or None. Visible watermark never appears on API output."""
-    global IMG_OK
-    if not IMG_OK:
-        return None
+    """Returns (mime, base64) or None. API images carry no visible watermark."""
+    global IMG_MODELS
+    if IMG_MODELS is None:
+        av = available_models()
+        IMG_MODELS = [os.getenv("GEMINI_IMAGE_MODEL")] if os.getenv("GEMINI_IMAGE_MODEL") else []
+        IMG_MODELS += [m for m in IMG_PREF if m in av or not av]
+        IMG_MODELS += [m for m in av if "image" in m and m not in IMG_MODELS]
+        print("image models to try:", IMG_MODELS)
     parts = [{"text": prompt}] + [{"inlineData": {"mimeType": m, "data": d}} for m, d in refs]
-    body = {"contents": [{"parts": parts}],
-            "generationConfig": {"responseModalities": ["IMAGE"], "imageConfig": {"aspectRatio": aspect}}}
-    for i in range(3):
-        try:
-            r = requests.post(GEM + GEM_IMG + ":generateContent", params={"key": os.environ["GEMINI_API_KEY"]},
-                              json=body, timeout=180)
-        except Exception as e:
-            print("img error", e); time.sleep(10); continue
-        if r.status_code == 200:
-            for p in r.json().get("candidates", [{}])[0].get("content", {}).get("parts", []):
-                d = p.get("inlineData") or p.get("inline_data")
-                if d:
-                    return d.get("mimeType") or d.get("mime_type") or "image/png", d["data"]
-            return None
-        print("img status", r.status_code, r.text[:200])
-        if "limit: 0" in r.text:
-            IMG_OK = False
-            return None
-        time.sleep(25 if r.status_code == 429 else 8)
+    for model in list(IMG_MODELS):
+        for attempt in range(3):
+            cfg = {"responseModalities": ["IMAGE"]}
+            if attempt != 1:
+                cfg["imageConfig"] = {"aspectRatio": aspect}
+            try:
+                r = requests.post(GEM + model + ":generateContent", params={"key": os.environ["GEMINI_API_KEY"]},
+                                  json={"contents": [{"role": "user", "parts": parts}], "generationConfig": cfg}, timeout=180)
+            except Exception as e:
+                print("img error", e); time.sleep(10); continue
+            if r.status_code == 200:
+                for p in r.json().get("candidates", [{}])[0].get("content", {}).get("parts", []):
+                    d = p.get("inlineData") or p.get("inline_data")
+                    if d:
+                        return d.get("mimeType") or d.get("mime_type") or "image/png", d["data"]
+                break  # no image returned -> next model
+            print("img", model, r.status_code, r.text[:200])
+            if r.status_code == 429 and "limit: 0" not in r.text:
+                time.sleep(25); continue
+            if r.status_code == 400 and attempt == 0:
+                continue  # retry once without aspect config
+            if r.status_code in (400, 403, 404, 429):
+                if model in IMG_MODELS:
+                    IMG_MODELS.remove(model)
+                break
     return None
 
 
