@@ -29,6 +29,8 @@ jobs:
           NICHE_HINT: ${{ vars.NICHE_HINT }}
           GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
           GEMINI_IMAGE_MODEL: ${{ vars.GEMINI_IMAGE_MODEL }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
       - name: save history and dashboard data
         if: always()
         run: |
