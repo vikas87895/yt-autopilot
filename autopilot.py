@@ -1,6 +1,6 @@
 """yt-autopilot v2: trending topic -> story script -> Gemini images (consistent characters)
 -> multi-voice TTS -> music + sfx -> Ken Burns video -> thumbnail -> scheduled upload -> dashboard data."""
-import os, io, re, sys, glob, json, time, base64, random, wave, asyncio, subprocess, traceback, datetime as dt
+import os, io, re, sys, glob, math, json, time, base64, random, wave, asyncio, subprocess, traceback, datetime as dt
 import requests, numpy as np
 import edge_tts
 from PIL import Image, ImageDraw, ImageFont, ImageEnhance, ImageFilter
@@ -299,13 +299,41 @@ Return JSON: {{"topic":"","angle":"","why":""}}"""
     return gemini_json(prompt)
 
 
+def proofread(s):
+    """Second Gemini pass: fix Hindi spelling/matra mistakes so subtitles and voice are correct."""
+    if LANG != "hi":
+        return s
+    refs = [("title",), ("thumb_text",)] + [("line", i, j) for i, sc in enumerate(s["scenes"]) for j in range(len(sc["lines"]))]
+
+    def get(r):
+        return s[r[0]] if r[0] in ("title", "thumb_text") else s["scenes"][r[1]]["lines"][r[2]]["text"]
+    texts = [get(r) for r in refs]
+    try:
+        out = gemini_json("Fix ONLY spelling, matra and grammar mistakes in these Hindi (Devanagari) strings. Keep meaning, "
+                          "length, tone and any English words unchanged. Do not translate. Return JSON "
+                          '{"strings": [...]} with exactly the same count and order.\n' + json.dumps(texts, ensure_ascii=False),
+                          temperature=0.1)["strings"]
+        if len(out) == len(texts):
+            for r, t in zip(refs, out):
+                if not isinstance(t, str) or not t.strip():
+                    continue
+                if r[0] in ("title", "thumb_text"):
+                    s[r[0]] = t
+                else:
+                    s["scenes"][r[1]]["lines"][r[2]]["text"] = t
+            print("proofread: ok")
+    except Exception as e:
+        print("proofread skipped:", e)
+    return s
+
+
 def write_script(t, fmt):
     short = fmt == "short"
-    n = 8 if short else 16
+    n = 12 if short else 24
     prompt = f"""Write a high-retention illustrated {'Short' if short else 'video'} for YouTube. Language of speech/title/description: {LANG}
 (Hindi = Devanagari, simple spoken words). Topic: {t['topic']}. Angle: {t['angle']}.
 {'Total spoken words 110-130, hook in first 2 seconds.' if short else 'Total spoken words 800-950, hook in first 10 seconds, clear payoff, short CTA at end.'}
-Accurate facts only, no clickbait lies, short punchy lines. Use 1-3 recurring characters ONLY if they make it better
+The VERY FIRST spoken line must be a hook under 12 words (shocking fact, bold claim or question), never a greeting like 'namaste dosto'. Accurate facts only, no clickbait lies, short punchy lines, a surprising fact or question every few seconds, end each scene on a mini-cliffhanger so viewers keep watching. Use 1-3 recurring characters ONLY if they make it better
 (e.g. a curious kid + a wise teacher); narrator speaks the rest.
 Make exactly {n} scenes. Each scene: "image_prompt" (English, vivid, describes action/setting/camera, NO text in image),
 "characters" (ids appearing), "sfx" (one of none, whoosh, impact, ding), "lines" (1-3 items {{"speaker": "narrator" or character id, "text": "..."}}).
@@ -315,6 +343,7 @@ Characters: {{"id":"c1","name":"","look":"detailed fixed appearance: age, clothe
 Also "title" (max 70 chars, honest curiosity), "description" (3-5 lines + hashtags), "tags" (10-15), "thumb_text" (max 4 words in {LANG}).
 Return JSON with keys: title, description, tags, thumb_text, style, music_mood, characters, scenes."""
     s = gemini_json(prompt)
+    s = proofread(s)
     s["title"] = s["title"][:95]
     if short:
         s["description"] += "\n#Shorts"
@@ -391,7 +420,7 @@ _TTS_LAST = [0.0]
 TTS_DEAD = False
 
 
-def gemini_tts(text, kind, out_wav, work):
+def gemini_tts(text, kind, out_wav, work, style_override=None):
     """Writes a 24k mono wav (with 0.22s tail) and returns True, or False if Gemini TTS is unavailable."""
     global _TTS, TTS_DEAD
     if TTS_DEAD or (os.getenv("USE_GEMINI_TTS") or "true").lower() == "false":
@@ -403,6 +432,7 @@ def gemini_tts(text, kind, out_wav, work):
             _TTS = TTS_PREF[:2]
         print("tts models to try:", _TTS)
     voice, style = GVOICE.get(kind, GVOICE["narrator"])
+    style = style_override or style
     for model in list(_TTS):
         new = "3.8" in model
         for attempt in range(3):
@@ -486,11 +516,14 @@ def approx_words(text, d):
     return out
 
 
-def make_voice(s, work, chunk):
+HOOK_STYLE = ("high-energy, punchy and dramatic opening line, slightly faster pace, attention-grabbing, "
+              "like a top YouTube storyteller, natural spoken delivery")
+
+
+def make_voice(s, work, chunk, use_gemini=True):
     kinds = {c["id"]: c.get("voice", "male") for c in s.get("characters", [])}
     vmap = VOICES.get(LANG, VOICES["hi"])
     cursor, wavs, caps, times = 0.0, [], [], []
-    n_tts = 0
     for si, sc in enumerate(s["scenes"]):
         start = cursor
         groups = []  # merge neighbouring lines of the same speaker -> fewer TTS requests
@@ -501,37 +534,38 @@ def make_voice(s, work, chunk):
                 groups.append([ln["speaker"], [ln["text"]]])
         for li, (sp, texts) in enumerate(groups):
             text = " ".join(texts)
-            kind = "narrator" if sp == "narrator" else kinds.get(sp, "male")
+            kind = kinds.get(sp, "narrator")  # unknown speaker name -> narrator
+            hook = si == 0 and li == 0
             wav = f"l{si}_{li}.wav"
             words = None
-            if gemini_tts(text, kind, os.path.join(work, wav), work):
-                n_tts += 1
-                words = None
+            if use_gemini:
+                if gemini_tts(text, kind, os.path.join(work, wav), work, HOOK_STYLE if hook else None):
+                    pass
+                else:
+                    print("Gemini voice failed mid-video -> redoing whole voice with edge-tts (keeps one consistent voice)")
+                    return make_voice(s, work, chunk, use_gemini=False)
             else:
+                v = vmap.get(kind, vmap["narrator"])
+                if hook:  # catchier opening: a bit faster and higher
+                    v = (v[0], "+6Hz" if kind != "old" else v[1], "+8%")
                 mp3 = f"l{si}_{li}.mp3"
-                words = asyncio.run(_tts(text, vmap.get(kind, vmap["narrator"]), os.path.join(work, mp3)))
+                words = asyncio.run(_tts(text, v, os.path.join(work, mp3)))
                 run(["ffmpeg", "-y", "-i", mp3, "-ar", str(SR), "-ac", "1", "-sample_fmt", "s16",
                      "-af", "apad=pad_dur=0.22", wav], work)
             d = dur(os.path.join(work, wav))
-            if words is None:
+            if not words:
                 words = approx_words(text, d - 0.22)
             caps += [(cursor + w[0], cursor + w[0] + w[1], w[2]) for w in words]
             cursor += d
             wavs.append(os.path.join(work, wav))
         times.append((start, cursor))
-        print(f"voice scene {si + 1}/{len(s['scenes'])} done ({'gemini' if n_tts else 'edge'} so far)")
+        print(f"voice scene {si + 1}/{len(s['scenes'])} done ({'gemini' if use_gemini else 'edge'})")
     with wave.open(os.path.join(work, "voice.wav"), "wb") as out:
         out.setnchannels(1); out.setsampwidth(2); out.setframerate(SR)
         for w in wavs:
             with wave.open(w) as r:
                 out.writeframes(r.readframes(r.getnframes()))
-    has = bool(caps)
-    if has:
-        with open(os.path.join(work, "caps.srt"), "w", encoding="utf-8") as f:
-            for i in range(0, len(caps), chunk):
-                g = caps[i:i + chunk]
-                f.write(f"{i // chunk + 1}\n{_ts(g[0][0])} --> {_ts(g[-1][1])}\n{' '.join(x[2] for x in g)}\n\n")
-    return times, has
+    return times, caps
 
 
 # ---------------------------------------------------------------- music + sfx (synthesised, copyright-free)
@@ -593,6 +627,133 @@ def pad(mood, total):
     return mix * fade
 
 
+SCALES = {"major": [0, 2, 4, 5, 7, 9, 11], "minor": [0, 2, 3, 5, 7, 8, 10]}
+MOODS = {
+    "calm": dict(bpm=76, root=57, scale="minor", prog=[0, 5, 3, 4], sev=True, swing=0.14, drums=1, mel=0.55, lp=4200, crackle=True),
+    "happy": dict(bpm=104, root=60, scale="major", prog=[0, 4, 5, 3], sev=False, swing=0.06, drums=2, mel=0.75, lp=8000, crackle=False),
+    "sad": dict(bpm=64, root=57, scale="minor", prog=[0, 3, 5, 4], sev=True, swing=0.1, drums=0, mel=0.35, lp=3800, crackle=True),
+    "tense": dict(bpm=92, root=50, scale="minor", prog=[0, 0, 5, 4], sev=False, swing=0.0, drums=2, mel=0.2, lp=6000, crackle=False),
+    "epic": dict(bpm=88, root=55, scale="minor", prog=[0, 5, 2, 6], sev=False, swing=0.0, drums=3, mel=0.45, lp=9000, crackle=False),
+}
+
+
+def _mtof(m):
+    return 440.0 * 2 ** ((m - 69) / 12)
+
+
+def _tt(d):
+    return np.arange(int(d * SR)) / SR
+
+
+def _kick():
+    t = _tt(0.35)
+    return np.sin(2 * np.pi * np.cumsum(45 + 95 * np.exp(-t * 32)) / SR) * np.exp(-t * 8)
+
+
+def _snare():
+    t = _tt(0.25)
+    n = np.diff(np.random.randn(len(t)), prepend=0)
+    return n * 0.5 * np.exp(-t * 22) + np.sin(2 * np.pi * 185 * t) * 0.35 * np.exp(-t * 30)
+
+
+def _hat():
+    t = _tt(0.06)
+    return np.diff(np.random.randn(len(t)), prepend=0) * np.exp(-t * 70) * 0.35
+
+
+def _epiano(f, d):
+    t = _tt(d)
+    mod = np.sin(2 * np.pi * f * t) * 1.4 * np.exp(-5 * t)
+    y = np.sin(2 * np.pi * f * t + mod) * np.exp(-1.8 * t) + 0.2 * np.sin(2 * np.pi * 3 * f * t) * np.exp(-9 * t)
+    return y * np.minimum(1, t * 120)
+
+
+def _bass(f, d):
+    t = _tt(d)
+    return (np.sin(2 * np.pi * f * t) + 0.25 * np.sin(2 * np.pi * 2 * f * t)) * np.exp(-1.6 * t) * np.minimum(1, t * 150)
+
+
+def _pluck(f, d):
+    t = _tt(d)
+    return (np.sin(2 * np.pi * f * t) + 0.35 * np.sin(2 * np.pi * 2 * f * t) * np.exp(-6 * t)) * np.exp(-4 * t) * np.minimum(1, t * 200)
+
+
+def lofi_loop(mood, seed):
+    """8 bars of original lo-fi/ambient music (chords, bass, drums, melody, reverb). Copyright-free, made from scratch."""
+    rng = random.Random(seed)
+    np.random.seed(seed)
+    c = MOODS.get(mood, MOODS["calm"])
+    beat = 60 / c["bpm"]
+    bar = 4 * beat
+    L = int(8 * bar * SR)
+    tail = 3 * SR
+    buf = np.zeros(L + tail)
+
+    def add(snd, t, g=1.0):
+        st = int(t * SR)
+        if st < L:
+            e = min(len(buf), st + len(snd))
+            buf[st:e] += snd[:e - st] * g
+
+    sc = SCALES[c["scale"]]
+
+    def note(deg, octv=0):
+        return c["root"] + sc[deg % 7] + 12 * (deg // 7) + 12 * octv
+
+    for ci, deg in enumerate(c["prog"]):
+        t0 = ci * 2 * bar
+        top = deg + 6 if c["sev"] else deg + 7
+        for j, m in enumerate([note(deg), note(deg + 2), note(deg + 4), note(top)]):
+            add(_epiano(_mtof(m), 2 * bar + 0.5), t0 + j * 0.018, 0.20)
+        for b in (0, 3, 4, 6):
+            add(_bass(_mtof(note(deg) - 12), beat * 1.9), t0 + b * beat, 0.55)
+    for b in range(8):
+        t = b * bar
+        if c["drums"] >= 1:
+            add(_kick(), t, 0.8)
+            add(_kick(), t + 2 * beat, 0.7)
+            if c["drums"] >= 2:
+                add(_kick(), t + 2.5 * beat, 0.45)
+            if c["drums"] >= 3:
+                add(_kick(), t + beat, 0.5); add(_kick(), t + 3 * beat, 0.5)
+            add(_snare(), t + beat, 0.5)
+            add(_snare(), t + 3 * beat, 0.55)
+            for e in range(8):
+                add(_hat(), t + e * beat / 2 + (c["swing"] * beat if e % 2 else 0), 0.5 if e % 2 == 0 else 0.3)
+    pent, cur = [0, 1, 2, 4, 5], 2
+    for b in range(8):
+        for e in range(8):
+            if rng.random() < c["mel"] * (1 if e % 2 == 0 else 0.5):
+                cur = max(0, min(4, cur + rng.choice([-2, -1, 0, 1, 2])))
+                add(_pluck(_mtof(note(pent[cur], 1)), 0.9), b * bar + e * beat / 2 + (c["swing"] * beat if e % 2 else 0), 0.16)
+    loop = buf[:L].copy()
+    loop[:tail] += buf[L:]
+    n = int(1.1 * SR)
+    ir = np.random.randn(n) * np.exp(-np.arange(n) / (0.28 * SR))
+    ir /= np.sqrt(np.sum(ir ** 2))
+    wet = np.fft.irfft(np.fft.rfft(loop) * np.fft.rfft(ir, n=L), n=L)
+    x = loop * 0.8 + wet * 0.5
+    f = np.fft.rfftfreq(L, 1 / SR)
+    x = np.fft.irfft(np.fft.rfft(x) / (1 + (f / c["lp"]) ** 2), n=L)
+    if c["crackle"]:
+        x += (np.random.rand(L) < 0.0004) * np.random.randn(L) * 0.12 + np.random.randn(L) * 0.004
+    return x / max(1e-6, np.abs(x).max()) * 0.9
+
+
+def lofi(mood, total):
+    seeds = random.sample(range(1, 10 ** 6), 2)
+    A, B = lofi_loop(mood, seeds[0]), lofi_loop(mood, seeds[1])
+    n = int(total * SR)
+    out, pos, i = np.zeros(n), 0, 0
+    while pos < n:
+        seg = A if i % 2 == 0 else B
+        take = min(len(seg), n - pos)
+        out[pos:pos + take] = seg[:take]
+        pos += take; i += 1
+    x = np.arange(n) / SR
+    return out * np.minimum(1, np.minimum(x / 1.5, (total - x) / 2.5))
+
+
 def user_music(mood, total, work):
     """Real tracks the owner uploaded to the music/ folder (name them like calm_1.mp3, happy_2.mp3 ...)."""
     files = [f for f in glob.glob("music/*") if f.lower().endswith((".mp3", ".wav", ".m4a", ".ogg", ".aac"))]
@@ -625,9 +786,14 @@ def mix_audio(s, times, work):
     track = user_music(mood, total, work)
     real = track is not None
     if track is None:
-        track = pad(mood, total)
+        try:
+            track = lofi(mood, total)
+            print("music: generated", mood, "lo-fi track")
+        except Exception as e:
+            print("lofi failed, using simple pad:", e)
+            track = pad(mood, total)
     track = np.pad(track, (0, max(0, len(voice) - len(track))))[:len(voice)]
-    bed = track * (0.20 if real else 0.12) * duck
+    bed = track * (0.20 if real else 0.17) * duck
     fx = np.zeros(len(voice))
     for i, (a, _) in enumerate(times):
         for kind, off in (("whoosh", -0.15 if i else None), (s["scenes"][i].get("sfx", "none"), 0.05)):
@@ -644,37 +810,117 @@ def mix_audio(s, times, work):
 
 
 # ---------------------------------------------------------------- video
-def render(s, fmt, work, imgs, times, has_caps):
+FPS = 30
+try:
+    _TR, _BC = Image.Transform.EXTENT, Image.Resampling.BICUBIC
+except AttributeError:
+    _TR, _BC = Image.EXTENT, Image.BICUBIC
+
+
+def _ass_time(t):
+    cs = int(round(max(0, t) * 100))
+    return f"{cs // 360000}:{cs % 360000 // 6000:02d}:{cs % 6000 // 100:02d}.{cs % 100:02d}"
+
+
+def make_ass(path, caps, W, H, short, hook):
+    """Word-highlight captions (libass shapes Devanagari correctly) + a hook line at the top."""
+    fs = 88 if short else 54
+    head = (f"[Script Info]\nScriptType: v4.00+\nPlayResX: {W}\nPlayResY: {H}\nWrapStyle: 0\nScaledBorderAndShadow: yes\n\n"
+            "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, "
+            "Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
+            f"Style: Cap,Noto Sans Devanagari,{fs},&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,{6 if short else 4},2,2,60,60,{int(H * 0.22) if short else 50},1\n"
+            f"Style: Hook,Noto Sans Devanagari,{int(fs * 1.2)},&H0000E5FF,&H0000E5FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,{7 if short else 5},3,8,60,60,{int(H * 0.09)},1\n\n"
+            "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n")
+    ev = []
+    if hook:
+        ev.append(f"Dialogue: 1,{_ass_time(0.2)},{_ass_time(2.8)},Hook,,0,0,0,,{{\\fad(250,350)}}{hook}")
+    N = 3 if short else 5
+    chunks, cur = [], []
+    for w in caps:
+        cur.append(w)
+        if len(cur) >= N or w[2].rstrip()[-1:] in "\u0964.?!":
+            chunks.append(cur); cur = []
+    if cur:
+        chunks.append(cur)
+    for ci, ch in enumerate(chunks):
+        nxt = chunks[ci + 1][0][0] if ci + 1 < len(chunks) else ch[-1][1] + 0.4
+        for k, w in enumerate(ch):
+            end = ch[k + 1][0] if k + 1 < len(ch) else min(nxt, max(w[1], w[0] + 0.15) + 0.25)
+            parts = []
+            for j, x in enumerate(ch):
+                x = x[2].replace("{", "").replace("}", "")
+                parts.append(("{\\c&H0000E5FF&}" + x + "{\\c&H00FFFFFF&}") if j == k else x)
+            pop = "{\\fscx100\\fscy100\\t(0,90,\\fscx108\\fscy108)\\t(90,180,\\fscx100\\fscy100)}"
+            ev.append(f"Dialogue: 0,{_ass_time(w[0])},{_ass_time(end)},Cap,,0,0,0,,{pop}{' '.join(parts)}")
+    open(path, "w", encoding="utf-8").write(head + "\n".join(ev) + "\n")
+
+
+def _prep(path, W, H, k=1.3):
+    im = Image.open(path).convert("RGB")
+    tw, th = int(W * k), int(H * k)
+    r = max(tw / im.width, th / im.height)
+    im = im.resize((max(tw, int(im.width * r + 0.5)), max(th, int(im.height * r + 0.5))), Image.LANCZOS)
+    l, t = (im.width - tw) // 2, (im.height - th) // 2
+    return im.crop((l, t, l + tw, t + th)).filter(ImageFilter.UnsharpMask(radius=2, percent=60, threshold=3))
+
+
+def _box(tw, th, mode, sign, t):
+    e = t * t * (3 - 2 * t)  # ease in-out
+    z = 1.0 + 0.16 * e if mode == 0 else (1.16 - 0.16 * e if mode == 1 else 1.14)
+    vw, vh = tw / z, th / z
+    cx, cy = tw / 2, th / 2
+    if mode == 2:
+        cx += sign * (e - 0.5) * (tw - vw) * 0.9
+    if mode == 3:
+        cy += sign * (e - 0.5) * (th - vh) * 0.9
+    return (cx - vw / 2, cy - vh / 2, cx + vw / 2, cy + vh / 2)
+
+
+def render(s, fmt, work, imgs, times, caps):
     short = fmt == "short"
-    W, H = (720, 1280) if short else (1280, 720)
-    parts = []
-    for i, (img, (a, b)) in enumerate(zip(imgs, times)):
-        d = b - a + (0.6 if i == len(times) - 1 else 0)
-        fr = max(15, round(d * 30))
-        mode = i % 3
-        if mode == 0:
-            z, x, y = "min(zoom+0.0007,1.2)", "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
-        elif mode == 1:
-            z, x, y = "if(eq(on,0),1.2,max(zoom-0.0007,1.0))", "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
-        else:
-            z, x, y = "1.15", f"(iw-iw/zoom)*on/{fr}", "ih/2-(ih/zoom/2)"
-        vf = (f"scale={W * 2}:{H * 2}:force_original_aspect_ratio=increase,crop={W * 2}:{H * 2},"
-              f"zoompan=z='{z}':x='{x}':y='{y}':d={fr}:s={W}x{H}:fps=30,setsar=1,format=yuv420p")
-        out = f"clip{i}.mp4"
-        run(["ffmpeg", "-y", "-loop", "1", "-i", img, "-vf", vf, "-frames:v", str(fr),
-             "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", out], work)
-        parts.append(out)
-    with open(os.path.join(work, "list.txt"), "w") as f:
-        f.writelines(f"file '{p}'\n" for p in parts)
-    run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", "list.txt", "-c", "copy", "joined.mp4"], work)
-    style = (f"FontName=Noto Sans Devanagari,Bold=1,FontSize={16 if short else 13},PrimaryColour=&H00FFFFFF&,"
-             f"OutlineColour=&H00000000&,BorderStyle=1,Outline=2,Alignment=2,MarginV={110 if short else 30}")
-    cmd = ["ffmpeg", "-y", "-i", "joined.mp4", "-i", "mix.wav"]
-    if has_caps:
-        cmd += ["-vf", f"subtitles=caps.srt:force_style='{style}'"]
-    cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "160k",
-            "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-shortest", "final.mp4"]
-    run(cmd, work)
+    W, H = (1080, 1920) if short else (1280, 720)
+    preps = [_prep(os.path.join(work, p), W, H) for p in imgs]
+    A, B = [a for a, _ in times], [b for _, b in times]
+    total = B[-1] + 0.6
+    B[-1] = total
+    h = 0.175  # half of the 0.35s crossfade
+    MODES = [0, 2, 1, 3]
+
+    def scene_frame(i, gt):
+        t = min(1.0, max(0.0, (gt - A[i]) / max(0.1, B[i] - A[i])))
+        tw, th = preps[i].size
+        box = _box(tw, th, MODES[i % 4], 1 if i % 2 == 0 else -1, t)
+        return preps[i].transform((W, H), _TR, box, resample=_BC)
+
+    def frame_at(gt):
+        i = 0
+        while i < len(A) - 1 and gt >= B[i] - h:
+            i += 1
+        if i > 0 and gt < A[i] + h:
+            al = min(1.0, max(0.0, (gt - (A[i] - h)) / (2 * h)))
+            return Image.blend(scene_frame(i - 1, gt), scene_frame(i, gt), al)
+        return scene_frame(i, gt)
+
+    n = int(math.ceil(total * FPS))
+    cmd = ["ffmpeg", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{W}x{H}", "-r", str(FPS), "-i", "-",
+           "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "joined.mp4"]
+    log = open(os.path.join(work, "ff_frames.log"), "w")
+    p = subprocess.Popen(cmd, cwd=work, stdin=subprocess.PIPE, stderr=log)
+    for k in range(n):
+        p.stdin.write(frame_at(k / FPS).tobytes())
+        if k % 300 == 0:
+            print(f"render {k}/{n} frames", flush=True)
+    p.stdin.close()
+    if p.wait():
+        raise RuntimeError("frame encode failed: " + open(os.path.join(work, "ff_frames.log")).read()[-800:])
+    vf = "eq=contrast=1.05:saturation=1.12,vignette=angle=PI/7"
+    if caps:
+        make_ass(os.path.join(work, "caps.ass"), caps, W, H, short, s.get("thumb_text", ""))
+        vf += ",ass=caps.ass"
+    run(["ffmpeg", "-y", "-i", "joined.mp4", "-i", "mix.wav", "-vf", vf, "-c:v", "libx264", "-preset", "veryfast",
+         "-crf", "20", "-af", "loudnorm=I=-14:TP=-1.5:LRA=11", "-ar", "48000", "-ac", "2", "-c:a", "aac", "-b:a", "192k",
+         "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+         "-shortest", "final.mp4"], work)
     return os.path.join(work, "final.mp4")
 
 
@@ -744,14 +990,14 @@ def make_one(yt, hist, stats, fmt, idx):
     work = f"work_{fmt}"
     os.makedirs(work, exist_ok=True)
     imgs = make_images(s, fmt, work)
-    times, has_caps = make_voice(s, work, 3 if fmt == "short" else 5)
+    times, caps = make_voice(s, work, 3 if fmt == "short" else 5)
     mix_audio(s, times, work)
-    video = render(s, fmt, work, imgs, times, has_caps)
+    video = render(s, fmt, work, imgs, times, caps)
     thumb = make_thumb(os.path.join(work, imgs[0]), s["thumb_text"], os.path.join(work, "thumb.jpg"))
     slot = None if REVIEW else next_slot(stats["best_hour"], 3 * idx)
     vid = upload(yt, video, thumb, s, slot)
     print("Uploaded:", vid, "scheduled:", slot)
-    hist.append(dict(date=dt.date.today().isoformat(), topic=t["topic"], title=s["title"], fmt=fmt, id=vid, when=slot or "private"))
+    hist.append(dict(date=dt.datetime.now(IST).date().isoformat(), topic=t["topic"], title=s["title"], fmt=fmt, id=vid, when=slot or "private"))
     json.dump(hist, open("history.json", "w"), ensure_ascii=False, indent=1)
     write_dashboard(stats, hist)
 
@@ -759,6 +1005,10 @@ def make_one(yt, hist, stats, fmt, idx):
 def main():
     yt = youtube()
     hist = json.load(open("history.json")) if os.path.exists("history.json") else []
+    today = dt.datetime.now(IST).date().isoformat()
+    if os.getenv("GITHUB_EVENT_NAME") == "schedule" and any(h.get("date") == today for h in hist):
+        print("Aaj ka video ban chuka hai, scheduled run skip.")
+        return
     stats = analyze(yt)
     write_dashboard(stats, hist)
     if (os.getenv("RUN_BOTH") or "").lower() == "true" or os.path.exists("run_both.txt"):
