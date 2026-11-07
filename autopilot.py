@@ -1,6 +1,6 @@
 """yt-autopilot v2: trending topic -> story script -> Gemini images (consistent characters)
 -> multi-voice TTS -> music + sfx -> Ken Burns video -> thumbnail -> scheduled upload -> dashboard data."""
-import os, io, re, sys, glob, math, json, time, base64, random, wave, asyncio, subprocess, traceback, datetime as dt
+import os, io, re, sys, ssl, glob, math, json, time, base64, random, wave, asyncio, subprocess, traceback, datetime as dt
 import requests, numpy as np
 import edge_tts
 from PIL import Image, ImageDraw, ImageFont, ImageEnhance, ImageFilter
@@ -82,27 +82,43 @@ def text_models():
     return c
 
 
+BAD_TEXT, GOOD_TEXT = set(), [None]
+
+
 def gemini_json(prompt, temperature=0.8):
     body = {"contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"responseMimeType": "application/json", "temperature": temperature}}
+    models = [m for m in text_models() if m not in BAD_TEXT]
+    if GOOD_TEXT[0] in models:  # stick to the model that already worked
+        models = [GOOD_TEXT[0]] + [m for m in models if m != GOOD_TEXT[0]]
     last = None
-    for model in text_models():
+    for model in models:
         for i in range(2):
             try:
                 r = requests.post(GEM + model + ":generateContent", params={"key": os.environ["GEMINI_API_KEY"]},
-                                  json=body, timeout=180)
+                                  json=body, timeout=100)
                 if r.status_code in (400, 403, 404, 429):
                     last = f"{model}: {r.status_code} {r.text[:150]}"
                     print("text model skipped ->", last)
+                    if r.status_code != 429:
+                        BAD_TEXT.add(model)
                     break
                 r.raise_for_status()
                 parts = r.json()["candidates"][0]["content"]["parts"]
                 txt = "".join(p.get("text", "") for p in parts if not p.get("thought"))
+                out = json.loads(txt)
+                GOOD_TEXT[0] = model
                 print("text model used:", model)
-                return json.loads(txt)
+                return out
+            except requests.exceptions.Timeout:
+                last = f"{model}: timeout"
+                print("text model timed out, dropping it:", model)
+                BAD_TEXT.add(model)
+                break
             except Exception as e:
                 last = f"{model}: {e}"
-                time.sleep(6)
+                print("text model error:", last)
+                time.sleep(4)
     raise RuntimeError(f"Gemini text failed on every model. Last: {last}")
 
 
@@ -126,9 +142,12 @@ def gemini_image(prompt, refs, aspect):
                 cfg["imageConfig"] = {"aspectRatio": aspect}
             try:
                 r = requests.post(GEM + model + ":generateContent", params={"key": os.environ["GEMINI_API_KEY"]},
-                                  json={"contents": [{"role": "user", "parts": parts}], "generationConfig": cfg}, timeout=180)
+                                  json={"contents": [{"role": "user", "parts": parts}], "generationConfig": cfg}, timeout=100)
             except Exception as e:
-                print("img error", e); time.sleep(10); continue
+                print("img error, dropping model:", model, e)
+                if model in IMG_MODELS:
+                    IMG_MODELS.remove(model)
+                break
             if r.status_code == 200:
                 for p in r.json().get("candidates", [{}])[0].get("content", {}).get("parts", []):
                     d = p.get("inlineData") or p.get("inline_data")
@@ -160,6 +179,7 @@ def pollinations_image(prompt, w, h):
 
 
 CF_DEAD = False
+CF_FAILS = [0]
 
 
 def cloudflare_image(prompt, w, h):
@@ -170,13 +190,17 @@ def cloudflare_image(prompt, w, h):
         return None
     url = f"https://api.cloudflare.com/client/v4/accounts/{acc}/ai/run/@cf/black-forest-labs/flux-1-schnell"
     for attempt in range(3):
-        body = {"prompt": prompt[:1900], "steps": 6}
-        if attempt == 0:
-            body.update(width=w, height=h)  # some models reject custom size -> retried without
+        body = {"prompt": prompt[:1900], "steps": 6}  # FLUX schnell makes square images; framing is done in _prep()
         try:
-            r = requests.post(url, headers={"Authorization": f"Bearer {tok}"}, json=body, timeout=150)
+            r = requests.post(url, headers={"Authorization": f"Bearer {tok}"}, json=body, timeout=90)
         except Exception as e:
-            print("cloudflare error:", e); time.sleep(8); continue
+            CF_FAILS[0] += 1
+            print("cloudflare error:", e)
+            if CF_FAILS[0] >= 4:
+                CF_DEAD = True
+                print("cloudflare keeps failing -> skipping it for the rest of this run")
+                return None
+            time.sleep(5); continue
         if r.status_code == 200:
             b64 = (r.json().get("result") or {}).get("image")
             if b64:
@@ -436,7 +460,7 @@ def gemini_tts(text, kind, out_wav, work, style_override=None):
     for model in list(_TTS):
         new = "3.8" in model
         for attempt in range(3):
-            wait = 21 - (time.time() - _TTS_LAST[0])
+            wait = 25 - (time.time() - _TTS_LAST[0])
             if wait > 0:
                 time.sleep(wait)
             _TTS_LAST[0] = time.time()
@@ -452,9 +476,12 @@ def gemini_tts(text, kind, out_wav, work, style_override=None):
                     "generationConfig": {"responseModalities": ["AUDIO"], "speechConfig": {"voiceConfig": vc}}}
             try:
                 r = requests.post(GEM + model + ":generateContent", params={"key": os.environ["GEMINI_API_KEY"]},
-                                  json=body, timeout=180)
+                                  json=body, timeout=100)
             except Exception as e:
-                print("tts error", e); continue
+                print("tts error, dropping model:", model, e)
+                if model in _TTS:
+                    _TTS.remove(model)
+                break
             if r.status_code == 200:
                 try:
                     d = r.json()["candidates"][0]["content"]["parts"][0]
@@ -858,6 +885,17 @@ def make_ass(path, caps, W, H, short, hook):
 def _prep(path, W, H, k=1.3):
     im = Image.open(path).convert("RGB")
     tw, th = int(W * k), int(H * k)
+    if im.width / im.height > (W / H) * 1.25:
+        # square/wide source on a vertical Short: keep the WHOLE picture, fill the rest with a blurred copy
+        r = max(tw / im.width, th / im.height)
+        bg = im.resize((int(im.width * r + 0.5), int(im.height * r + 0.5)), Image.BILINEAR)
+        l, t = (bg.width - tw) // 2, (bg.height - th) // 2
+        bg = bg.crop((l, t, l + tw, t + th)).filter(ImageFilter.GaussianBlur(28))
+        bg = ImageEnhance.Brightness(bg).enhance(0.55)
+        fh = int(im.height * tw / im.width)
+        fg = im.resize((tw, fh), Image.LANCZOS).filter(ImageFilter.UnsharpMask(radius=2, percent=60, threshold=3))
+        bg.paste(fg, (0, max(0, int(th * 0.44 - fh / 2))))  # slightly above centre: captions sit on the lower blur
+        return bg
     r = max(tw / im.width, th / im.height)
     im = im.resize((max(tw, int(im.width * r + 0.5)), max(th, int(im.height * r + 0.5))), Image.LANCZOS)
     l, t = (im.width - tw) // 2, (im.height - th) // 2
@@ -965,10 +1003,21 @@ def upload(yt, video, thumb, s, publish_at):
     for attempt in (0, 1):
         try:
             req = yt.videos().insert(part="snippet,status", body=body,
-                                     media_body=MediaFileUpload(video, chunksize=8 << 20, resumable=True))
-            resp = None
+                                     media_body=MediaFileUpload(video, chunksize=4 << 20, resumable=True))
+            resp, fails = None, 0
             while resp is None:
-                _, resp = req.next_chunk()
+                try:
+                    _, resp = req.next_chunk(num_retries=5)
+                except HttpError as e:
+                    if e.resp.status in (500, 502, 503, 504) and fails < 8:
+                        fails += 1; print("upload server error, retry", fails); time.sleep(5 * fails); continue
+                    raise
+                except (OSError, ssl.SSLError) as e:  # connection dropped mid-upload: resume
+                    fails += 1
+                    print("upload network error, resuming", fails, e)
+                    if fails > 12:
+                        raise
+                    time.sleep(5 * fails)
             break
         except HttpError as e:
             if attempt == 0 and "containsSyntheticMedia" in str(e):
