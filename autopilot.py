@@ -1,6 +1,6 @@
 """yt-autopilot v2: trending topic -> story script -> Gemini images (consistent characters)
 -> multi-voice TTS -> music + sfx -> Ken Burns video -> thumbnail -> scheduled upload -> dashboard data."""
-import os, io, re, sys, ssl, glob, math, json, time, base64, random, wave, asyncio, subprocess, traceback, datetime as dt
+import os, io, re, sys, ssl, glob, math, json, threading, itertools, time, base64, random, wave, asyncio, subprocess, traceback, datetime as dt
 import requests, numpy as np
 import edge_tts
 from PIL import Image, ImageDraw, ImageFont, ImageEnhance, ImageFilter
@@ -15,8 +15,11 @@ except Exception:
     pass
 LANG = os.getenv("CONTENT_LANG") or "hi"
 REVIEW = (os.getenv("REVIEW_MODE") or "false").lower() == "true"
+QUICK = (os.getenv("QUICK_TEST") or "").lower() == "true" or os.path.exists("quick_test.txt")  # fast smoke test
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 SR = 24000
+MUSIC_VOL = float(os.getenv("MUSIC_VOLUME") or 1.0)
+SFX_VOL = float(os.getenv("SFX_VOLUME") or 1.0)
 GEM = "https://generativelanguage.googleapis.com/v1beta/models/"
 
 
@@ -25,6 +28,27 @@ def run(cmd, cwd=None):
     p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
     if p.returncode:
         raise RuntimeError(p.stderr[-1500:])
+
+
+HARD = 120  # seconds: absolute limit for any single web request (requests' own timeout only counts silence)
+
+
+def hard_post(url, hard=None, **kw):
+    box = {}
+
+    def go():
+        try:
+            box["r"] = requests.post(url, **kw)
+        except Exception as e:
+            box["e"] = e
+    t = threading.Thread(target=go, daemon=True)
+    t.start()
+    t.join(hard or HARD)
+    if t.is_alive():
+        raise requests.exceptions.Timeout(f"hard timeout after {hard or HARD}s")
+    if "e" in box:
+        raise box["e"]
+    return box["r"]
 
 
 def dur(path):
@@ -68,7 +92,7 @@ def available_models():
     return _AV
 
 
-TEXT_PREF = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite",
+TEXT_PREF = ["gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.5-flash", "gemini-3.8-flash", "gemini-3.5-flash-lite",
              "gemini-3.1-flash-lite", "gemini-3-flash-preview", "gemini-flash-latest",
              "gemini-2.5-flash", "gemini-2.5-flash-lite"]
 IMG_PREF = ["gemini-3.1-flash-image", "gemini-3.1-flash-image-preview", "gemini-2.5-flash-image", "gemini-3-pro-image"]
@@ -95,7 +119,7 @@ def gemini_json(prompt, temperature=0.8):
     for model in models:
         for i in range(2):
             try:
-                r = requests.post(GEM + model + ":generateContent", params={"key": os.environ["GEMINI_API_KEY"]},
+                r = hard_post(GEM + model + ":generateContent", params={"key": os.environ["GEMINI_API_KEY"]},
                                   json=body, timeout=100)
                 if r.status_code in (400, 403, 404, 429):
                     last = f"{model}: {r.status_code} {r.text[:150]}"
@@ -141,7 +165,7 @@ def gemini_image(prompt, refs, aspect):
             if attempt != 1:
                 cfg["imageConfig"] = {"aspectRatio": aspect}
             try:
-                r = requests.post(GEM + model + ":generateContent", params={"key": os.environ["GEMINI_API_KEY"]},
+                r = hard_post(GEM + model + ":generateContent", params={"key": os.environ["GEMINI_API_KEY"]},
                                   json={"contents": [{"role": "user", "parts": parts}], "generationConfig": cfg}, timeout=100)
             except Exception as e:
                 print("img error, dropping model:", model, e)
@@ -166,6 +190,9 @@ def gemini_image(prompt, refs, aspect):
     return None
 
 
+ALLOW_FALLBACK = (os.getenv("ALLOW_FALLBACK_IMAGES") or "").lower() == "true" or os.path.exists("allow_fallback.txt")
+
+
 def pollinations_image(prompt, w, h):
     try:
         r = requests.get("https://image.pollinations.ai/prompt/" + requests.utils.quote(prompt[:400]),
@@ -178,40 +205,79 @@ def pollinations_image(prompt, w, h):
     return None
 
 
-CF_DEAD = False
-CF_FAILS = [0]
+CF_ACCS = None
 
 
-def cloudflare_image(prompt, w, h):
-    """Free: Cloudflare Workers AI FLUX-1-schnell (10,000 neurons/day)."""
-    global CF_DEAD
-    acc, tok = os.getenv("CF_ACCOUNT_ID"), os.getenv("CF_API_TOKEN")
-    if CF_DEAD or not (acc and tok):
-        return None
-    url = f"https://api.cloudflare.com/client/v4/accounts/{acc}/ai/run/@cf/black-forest-labs/flux-1-schnell"
+def _cf_accounts():
+    """Up to 3 Cloudflare accounts (CF_ACCOUNT_ID/CF_API_TOKEN, ..._2, ..._3). When one runs out we move to the next."""
+    global CF_ACCS
+    if CF_ACCS is None:
+        CF_ACCS = []
+        for suf in ("", "_2", "_3"):
+            acc = (os.getenv("CF_ACCOUNT_ID" + suf) or "").strip()
+            tok = (os.getenv("CF_API_TOKEN" + suf) or "").strip()
+            if acc and tok:
+                CF_ACCS.append(dict(id=acc, tok=tok, dead=False, why="", fails=0, n=len(CF_ACCS) + 1))
+        print(f"Cloudflare accounts configured: {len(CF_ACCS)}")
+    return CF_ACCS
+
+
+def cf_configured():
+    return bool(_cf_accounts())
+
+
+def cf_available():
+    return any(not a["dead"] for a in _cf_accounts())
+
+
+def cf_quota_exhausted():
+    accs = _cf_accounts()
+    return bool(accs) and all(a["dead"] and a["why"] == "quota" for a in accs)
+
+
+def _cf_try(acc, prompt, steps):
+    url = f"https://api.cloudflare.com/client/v4/accounts/{acc['id']}/ai/run/@cf/black-forest-labs/flux-1-schnell"
     for attempt in range(3):
-        body = {"prompt": prompt[:1900], "steps": 6}  # FLUX schnell makes square images; framing is done in _prep()
+        body = {"prompt": prompt[:1900], "steps": steps}  # FLUX schnell makes square images; framing is done later
         try:
-            r = requests.post(url, headers={"Authorization": f"Bearer {tok}"}, json=body, timeout=90)
+            r = hard_post(url, headers={"Authorization": f"Bearer {acc['tok']}"}, json=body, timeout=90)
         except Exception as e:
-            CF_FAILS[0] += 1
-            print("cloudflare error:", e)
-            if CF_FAILS[0] >= 4:
-                CF_DEAD = True
-                print("cloudflare keeps failing -> skipping it for the rest of this run")
+            acc["fails"] += 1
+            print(f"cloudflare account {acc['n']} error:", e)
+            if acc["fails"] >= 4:
+                acc["dead"], acc["why"] = True, "errors"
                 return None
-            time.sleep(5); continue
+            time.sleep(5)
+            continue
         if r.status_code == 200:
             b64 = (r.json().get("result") or {}).get("image")
             if b64:
                 return Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
             return None
-        print("cloudflare", r.status_code, r.text[:200])
+        print(f"cloudflare account {acc['n']}", r.status_code, r.text[:160])
         if r.status_code in (401, 403):
-            CF_DEAD = True
+            acc["dead"], acc["why"] = True, "auth"
+            print(f"CLOUDFLARE account {acc['n']}: ID ya token galat hai (401/403).")
             return None
         if r.status_code == 429:
+            low = r.text.lower()
+            if "free allocation" in low or "neurons" in low:
+                acc["dead"], acc["why"] = True, "quota"
+                print(f"CLOUDFLARE account {acc['n']}: aaj ki free limit khatam -> agle account pe shift.")
+                return None
             time.sleep(20)
+    return None
+
+
+def cloudflare_image(prompt, w=1024, h=1024, steps=4):
+    for acc in _cf_accounts():
+        if acc["dead"]:
+            continue
+        img = _cf_try(acc, prompt, steps)
+        if img is not None:
+            return img
+        if not acc["dead"]:
+            return None  # temporary problem, caller decides
     return None
 
 
@@ -353,10 +419,10 @@ def proofread(s):
 
 def write_script(t, fmt):
     short = fmt == "short"
-    n = 12 if short else 24
+    n = 6 if QUICK else (12 if short else 24)
     prompt = f"""Write a high-retention illustrated {'Short' if short else 'video'} for YouTube. Language of speech/title/description: {LANG}
 (Hindi = Devanagari, simple spoken words). Topic: {t['topic']}. Angle: {t['angle']}.
-{'Total spoken words 110-130, hook in first 2 seconds.' if short else 'Total spoken words 800-950, hook in first 10 seconds, clear payoff, short CTA at end.'}
+{'Total spoken words 50-60 only (quick test), hook in first 2 seconds.' if QUICK else 'Total spoken words 110-130, hook in first 2 seconds.' if short else 'Total spoken words 800-950, hook in first 10 seconds, clear payoff, short CTA at end.'}
 The VERY FIRST spoken line must be a hook under 12 words (shocking fact, bold claim or question), never a greeting like 'namaste dosto'. Accurate facts only, no clickbait lies, short punchy lines, a surprising fact or question every few seconds, end each scene on a mini-cliffhanger so viewers keep watching. Use 1-3 recurring characters ONLY if they make it better
 (e.g. a curious kid + a wise teacher); narrator speaks the rest.
 Make exactly {n} scenes. Each scene: "image_prompt" (English, vivid, describes action/setting/camera, NO text in image),
@@ -364,15 +430,54 @@ Make exactly {n} scenes. Each scene: "image_prompt" (English, vivid, describes a
 Characters: {{"id":"c1","name":"","look":"detailed fixed appearance: age, clothes, colors, hair","voice":"male|female|child|old"}}.
 "style": ONE art style sentence reused for every image (e.g. "vibrant 3D animated film style, warm cinematic lighting").
 "music_mood": one of calm, happy, sad, tense, epic.
-Also "title" (max 70 chars, honest curiosity), "description" (3-5 lines + hashtags), "tags" (10-15), "thumb_text" (max 4 words in {LANG}).
-Return JSON with keys: title, description, tags, thumb_text, style, music_mood, characters, scenes."""
+SEO rules for YouTube search in India:
+"title": max 65 chars. Start with the main search keyword people really type (in {LANG}; keep an English keyword if Indians search it in English), then a curiosity hook. Honest, no ALL CAPS, no emoji spam.
+"description": FIRST 2 lines (max 150 chars total) = hook + main keyword (this is what search shows). Then a natural 100-180 word summary using related keywords. No links, no timestamps (added automatically). Last line: one friendly line asking to subscribe.
+"hashtags": exactly 3 relevant hashtags. "tags": 12-15 strings (each max 30 chars) mixing broad and specific keywords, Hindi AND English/Hinglish spellings people search.
+"thumb_text": max 3 words in {LANG}, a shocking number or curious question. "thumb_prompt": English, ONE dramatic close-up subject for the thumbnail illustration.
+"category": one of education, science_tech, entertainment, howto.
+{"" if short else '"chapters": 6-8 items {"scene": <1-based scene number where the chapter starts>, "title": "max 40 chars"}, the first one at scene 1.'}
+Return JSON with keys: title, description, hashtags, tags, thumb_text, thumb_prompt, category, style, music_mood, characters, scenes{"" if short else ", chapters"}."""
     s = gemini_json(prompt)
     s = proofread(s)
-    s["title"] = s["title"][:95]
-    if short:
-        s["description"] += "\n#Shorts"
+    title = str(s.get("title", "")).strip()
+    if len(title) > 70:
+        title = title[:70].rsplit(" ", 1)[0]
+    s["title"] = title
+    tags, total = [], 0
+    for tg in s.get("tags") or []:
+        tg = str(tg).strip().lstrip("#")
+        if tg and len(tg) <= 30 and tg.lower() not in [x.lower() for x in tags] and total + len(tg) < 450:
+            tags.append(tg); total += len(tg) + 1
+    s["tags"] = tags[:15]
+    hs = [("#" + str(h).strip().lstrip("#").replace(" ", "")) for h in (s.get("hashtags") or [])[:3] if str(h).strip()]
+    if short and "#Shorts" not in hs:
+        hs.append("#Shorts")
+    s["_hashtags"] = " ".join(hs)
+    s["description"] = str(s.get("description", "")).strip()
+    chars = []
+    for i, c in enumerate(s.get("characters") or []):
+        if isinstance(c, dict):
+            c.setdefault("id", f"c{i + 1}")
+            c["id"] = str(c["id"])
+            c.setdefault("name", c["id"])
+            c.setdefault("look", "")
+            chars.append(c)
+    s["characters"] = chars
+    lookup = {}
+    for c in chars:
+        lookup[c["id"].lower()] = c["id"]
+        lookup[str(c["name"]).lower()] = c["id"]
+
+    def cid(x):  # Gemini sometimes returns names, ids or whole dicts
+        if isinstance(x, dict):
+            x = x.get("id") or x.get("name") or ""
+        return lookup.get(str(x).strip().lower(), "")
     for sc in s["scenes"]:
-        sc["lines"] = [l for l in sc.get("lines", []) if l.get("text")] or [{"speaker": "narrator", "text": "..."}]
+        sc["characters"] = [c for c in (cid(x) for x in (sc.get("characters") or [])) if c]
+        sc["lines"] = [l for l in sc.get("lines", []) if isinstance(l, dict) and l.get("text")] or [{"speaker": "narrator", "text": "..."}]
+        for l in sc["lines"]:
+            l["speaker"] = cid(l.get("speaker")) or "narrator"
     return s
 
 
@@ -388,7 +493,7 @@ def make_images(s, fmt, work):
     n = len(s["scenes"])
     imgs = [None] * n
     use_gemini_refs = False
-    if not (os.getenv("CF_ACCOUNT_ID") and os.getenv("CF_API_TOKEN")):
+    if not cf_configured():
         print("NOTE: CF_ACCOUNT_ID / CF_API_TOKEN not set -> only paid Gemini or low-quality fallback will work")
     for i, sc in enumerate(s["scenes"]):
         who = [chars[c] for c in sc.get("characters", []) if c in chars]
@@ -400,13 +505,15 @@ def make_images(s, fmt, work):
             r = gemini_image(prompt, [], aspect)
             if r:
                 img, src = Image.open(io.BytesIO(base64.b64decode(r[1]))).convert("RGB"), "gemini"
-        if img is None:
+        if img is None and ALLOW_FALLBACK:
             img, src = pollinations_image(prompt, gw, gh), "pollinations"
         print(f"scene {i + 1}/{n}: {'OK via ' + src if img else 'FAILED'}")
         imgs[i] = img
     good = [i for i, im in enumerate(imgs) if im is not None]
     if not good:
-        raise RuntimeError("Koi image nahi ban payi. Cloudflare keys (CF_ACCOUNT_ID, CF_API_TOKEN) check karo.")
+        raise RuntimeError(("Saare Cloudflare accounts ki aaj ki free image limit khatam hai (reset roz 5:30 AM IST). " if cf_quota_exhausted() else
+                            "Koi image nahi ban payi. Cloudflare keys (CF_ACCOUNT_ID, CF_API_TOKEN) check karo. ")
+                           + "Kharab video upload nahi kiya.")
     if len(good) < 0.6 * n:
         raise RuntimeError(f"Sirf {len(good)}/{n} images bani. Kharab video upload nahi kiya.")
     for i in range(n):  # fill gaps with nearest good image instead of a black card
@@ -419,6 +526,22 @@ def make_images(s, fmt, work):
         im.save(os.path.join(work, p), quality=95)
         paths.append(p)
     return paths
+
+
+def make_thumb_image(s, work):
+    """One extra picture made only for the thumbnail: single big subject, dramatic, high contrast."""
+    if not cf_available():
+        return None
+    prompt = (f"{s['style']}. YouTube thumbnail illustration: {s.get('thumb_prompt') or s.get('title', '')}. "
+              "Extreme close-up of ONE clear expressive subject, dramatic cinematic lighting, vibrant saturated colors, "
+              "high contrast, simple dark uncluttered background, subject slightly right of centre, ultra detailed, sharp focus. "
+              "No text, no watermark, no logo.")
+    img = cloudflare_image(prompt)
+    if img is None:
+        return None
+    p = "thumb_src.jpg"
+    img.save(os.path.join(work, p), quality=95)
+    return p
 
 
 # ---------------------------------------------------------------- voices
@@ -475,7 +598,7 @@ def gemini_tts(text, kind, out_wav, work, style_override=None):
             body = {"contents": [{"role": "user", "parts": [part]}],
                     "generationConfig": {"responseModalities": ["AUDIO"], "speechConfig": {"voiceConfig": vc}}}
             try:
-                r = requests.post(GEM + model + ":generateContent", params={"key": os.environ["GEMINI_API_KEY"]},
+                r = hard_post(GEM + model + ":generateContent", params={"key": os.environ["GEMINI_API_KEY"]},
                                   json=body, timeout=100)
             except Exception as e:
                 print("tts error, dropping model:", model, e)
@@ -607,15 +730,31 @@ def write_wav(p, x):
         w.writeframes((np.clip(x, -1, 1) * 32767).astype(np.int16).tobytes())
 
 
+def _band(x, lo, hi):
+    F = np.fft.rfft(x)
+    f = np.fft.rfftfreq(len(x), 1 / SR)
+    return np.fft.irfft(F * ((f >= lo) & (f < hi)), n=len(x))
+
+
 def sfx(kind):
-    if kind == "whoosh":
-        n = np.convolve(np.random.randn(int(0.7 * SR)), np.ones(40) / 40, "same") * 3
-        return n * np.sin(np.linspace(0, np.pi, len(n))) ** 2
-    x = np.arange(int(1.0 * SR)) / SR
-    if kind == "impact":
-        return np.sin(2 * np.pi * 55 * x) * np.exp(-x * 6) + 0.3 * np.random.randn(len(x)) * np.exp(-x * 30)
-    if kind == "ding":
-        return (np.sin(2 * np.pi * 1320 * x) + 0.5 * np.sin(2 * np.pi * 1980 * x)) * np.exp(-x * 4) * 0.5
+    """Small, soft, synthesised effects (original, copyright-free)."""
+    if kind == "whoosh":  # rising band-passed noise sweep
+        n = int(0.8 * SR)
+        x = np.random.randn(n)
+        t = np.linspace(0, 1, n)
+        out = np.zeros(n)
+        for k, (lo, hi) in enumerate(((150, 600), (600, 2000), (2000, 6500))):
+            out += _band(x, lo, hi) * np.exp(-((t - (0.25 + 0.25 * k)) ** 2) / (2 * 0.12 ** 2))
+        out *= np.sin(np.pi * t) ** 1.5
+        return out / max(1e-6, np.abs(out).max()) * 0.7
+    t = np.arange(int(1.3 * SR)) / SR
+    if kind == "impact":  # deep boom + short crack
+        boom = np.sin(2 * np.pi * np.cumsum(38 + 70 * np.exp(-t * 10)) / SR) * np.exp(-t * 3.2)
+        crack = np.random.randn(len(t)) * np.exp(-t * 45) * 0.35
+        return (boom + crack) * 0.9
+    if kind == "ding":  # bell-like inharmonic partials
+        y = sum(a * np.sin(2 * np.pi * 988 * r * t) * np.exp(-d * t) for r, a, d in ((1, 1.0, 3.0), (2.76, 0.45, 5.0), (5.4, 0.25, 8.0)))
+        return y * 0.45
     return None
 
 
@@ -781,23 +920,72 @@ def lofi(mood, total):
     return out * np.minimum(1, np.minimum(x / 1.5, (total - x) / 2.5))
 
 
+def _load_track(path, total, work, label):
+    out = os.path.join(work, "music.wav")
+    try:
+        run(["ffmpeg", "-y", "-stream_loop", "-1", "-i", os.path.abspath(path), "-t", f"{total:.2f}", "-ar", str(SR),
+             "-ac", "1", "-sample_fmt", "s16", "-af", f"afade=t=in:d=2,afade=t=out:st={max(0, total - 3):.2f}:d=3", out])
+        x = read_wav(out)
+        print("music track:", label)
+        return x / max(1e-6, np.abs(x).max())
+    except Exception as e:
+        print("music file failed:", e)
+        return None
+
+
 def user_music(mood, total, work):
-    """Real tracks the owner uploaded to the music/ folder (name them like calm_1.mp3, happy_2.mp3 ...)."""
+    """Optional: real tracks put in the music/ folder (name them like calm_1.mp3, happy_2.mp3 ...)."""
     files = [f for f in glob.glob("music/*") if f.lower().endswith((".mp3", ".wav", ".m4a", ".ogg", ".aac"))]
     if not files:
         return None
     pick = [f for f in files if mood in os.path.basename(f).lower()] or files
     f = random.choice(pick)
-    out = os.path.join(work, "music.wav")
-    try:
-        run(["ffmpeg", "-y", "-stream_loop", "-1", "-i", os.path.abspath(f), "-t", f"{total:.2f}", "-ar", str(SR),
-             "-ac", "1", "-sample_fmt", "s16", "-af", f"afade=t=in:d=2,afade=t=out:st={max(0, total - 3):.2f}:d=3", out])
-        x = read_wav(out)
-        print("music track:", os.path.basename(f))
-        return x / max(1e-6, np.abs(x).max())
-    except Exception as e:
-        print("music file failed:", e)
+    return _load_track(f, total, work, os.path.basename(f))
+
+
+LYRIA_PROMPTS = {
+    "calm": "relaxed warm lo-fi hip hop beat with soft electric piano, mellow bass and gentle drums",
+    "happy": "upbeat cheerful bright instrumental with light percussion, plucky melody and a feel-good groove",
+    "sad": "gentle emotional piano with soft strings, slow tempo",
+    "tense": "dark suspenseful cinematic pulse with low strings and subtle percussion, slowly building tension",
+    "epic": "epic cinematic orchestral instrumental with big drums, strings and rising energy",
+}
+LYRIA_DEAD = False
+
+
+def lyria_music(mood, total, work):
+    """Gemini Lyria 3 (real AI-composed music). If it is not available on this key, we silently fall back."""
+    global LYRIA_DEAD
+    if LYRIA_DEAD or (os.getenv("USE_LYRIA") or "true").lower() == "false":
         return None
+    av = available_models()
+    models = [m for m in ("lyria-3-pro-preview", "lyria-3-clip-preview") if m in av]
+    if total <= 35 and "lyria-3-clip-preview" in models:
+        models = ["lyria-3-clip-preview"] + [m for m in models if m != "lyria-3-clip-preview"]
+    prompt = (f"Instrumental background music for a YouTube explainer video: {LYRIA_PROMPTS.get(mood, LYRIA_PROMPTS['calm'])}. "
+              "NO vocals, no lyrics, no spoken words. Steady energy without sudden changes, easy to loop, mixed quietly "
+              "so a narrator can talk over it. About 90 seconds long.")
+    for model in models:
+        try:
+            r = hard_post(GEM + model + ":generateContent", params={"key": os.environ["GEMINI_API_KEY"]}, hard=240,
+                          json={"contents": [{"parts": [{"text": prompt}]}],
+                                "generationConfig": {"responseModalities": ["AUDIO", "TEXT"]}}, timeout=240)
+        except Exception as e:
+            print("lyria error:", model, e)
+            continue
+        if r.status_code != 200:
+            print("lyria", model, r.status_code, r.text[:140])
+            continue
+        for p in r.json().get("candidates", [{}])[0].get("content", {}).get("parts", []):
+            d = p.get("inlineData") or p.get("inline_data")
+            if d and "audio" in (d.get("mimeType") or d.get("mime_type") or ""):
+                path = os.path.join(work, "lyria_raw.mp3" if "wav" not in (d.get("mimeType") or "") else "lyria_raw.wav")
+                open(path, "wb").write(base64.b64decode(d["data"]))
+                x = _load_track(path, total, work, "Lyria " + model)
+                if x is not None:
+                    return x
+    LYRIA_DEAD = True
+    return None
 
 
 def mix_audio(s, times, work):
@@ -811,6 +999,8 @@ def mix_audio(s, times, work):
     duck = 1 - 0.7 * np.clip(env * 12, 0, 1)
     mood = s.get("music_mood", "calm")
     track = user_music(mood, total, work)
+    if track is None:
+        track = lyria_music(mood, total, work)
     real = track is not None
     if track is None:
         try:
@@ -820,7 +1010,7 @@ def mix_audio(s, times, work):
             print("lofi failed, using simple pad:", e)
             track = pad(mood, total)
     track = np.pad(track, (0, max(0, len(voice) - len(track))))[:len(voice)]
-    bed = track * (0.20 if real else 0.17) * duck
+    bed = track * (0.15 if real else 0.12) * MUSIC_VOL * duck
     fx = np.zeros(len(voice))
     for i, (a, _) in enumerate(times):
         for kind, off in (("whoosh", -0.15 if i else None), (s["scenes"][i].get("sfx", "none"), 0.05)):
@@ -831,7 +1021,7 @@ def mix_audio(s, times, work):
                 continue
             st = max(0, int((a + off) * SR))
             fx[st:st + len(snd)] += snd[:len(fx) - st]
-    mix = voice + bed + fx * 0.30
+    mix = voice + bed + fx * 0.22 * SFX_VOL
     mix /= max(1.0, np.abs(mix).max() / 0.95)
     write_wav(os.path.join(work, "mix.wav"), mix)
 
@@ -962,34 +1152,85 @@ def render(s, fmt, work, imgs, times, caps):
     return os.path.join(work, "final.mp4")
 
 
-def _font(size):
-    try:
-        f = subprocess.run(["fc-match", "-f", "%{file}", "Noto Sans Devanagari:bold"], capture_output=True, text=True).stdout
-        return ImageFont.truetype(f, size)
-    except Exception:
-        return ImageFont.load_default()
+_FONTS = {}
+
+
+def _font(size, latin=False):
+    key = (size, latin)
+    if key not in _FONTS:
+        try:
+            q = "Noto Sans:bold" if latin else "Noto Sans Devanagari:bold"
+            f = subprocess.run(["fc-match", "-f", "%{file}", q], capture_output=True, text=True).stdout
+            _FONTS[key] = ImageFont.truetype(f, size)
+        except Exception:
+            _FONTS[key] = ImageFont.load_default()
+    return _FONTS[key]
+
+
+def _runs(text):
+    return re.findall(r"[\u0900-\u097F]+|[^\u0900-\u097F]+", text)  # Hindi runs vs English/digit runs (different fonts)
+
+
+def _tlen(d, text, size):
+    return sum(d.textlength(r, font=_font(size, latin=not re.match(r"[\u0900-\u097F]", r))) for r in _runs(text))
+
+
+def _draw_runs(d, x, y, text, size, fill, sw, sf):
+    for r in _runs(text):
+        f = _font(size, latin=not re.match(r"[\u0900-\u097F]", r))
+        d.text((x, y), r, font=f, fill=fill, stroke_width=sw, stroke_fill=sf)
+        x += d.textlength(r, font=f)
+
+
+def _thumb_layout(d, text, box_w, max_h):
+    """Pick line breaks + the biggest font size that fits the left text area."""
+    words = text.split() or [text]
+    best = None
+    for n in (1, 2, 3):
+        if n > len(words):
+            break
+        for cuts in itertools.combinations(range(1, len(words)), n - 1):
+            idx = (0,) + cuts + (len(words),)
+            lines = [" ".join(words[idx[i]:idx[i + 1]]) for i in range(n)]
+            for size in range(170, 58, -6):
+                if int(size * 1.3) * n <= max_h and max(_tlen(d, ln, size) for ln in lines) <= box_w:
+                    cand = (size, -n, lines)
+                    if best is None or cand[:2] > best[:2]:
+                        best = cand
+                    break
+    return best or (60, -3, [" ".join(words[:2]), " ".join(words[2:4]), " ".join(words[4:6])])
 
 
 def make_thumb(img_path, text, out):
-    img = Image.open(img_path).convert("RGB")
-    r = max(1280 / img.width, 720 / img.height)
-    img = img.resize((int(img.width * r), int(img.height * r)))
-    l, t = (img.width - 1280) // 2, (img.height - 720) // 2
-    img = ImageEnhance.Brightness(ImageEnhance.Color(img.crop((l, t, l + 1280, t + 720))).enhance(1.3)).enhance(0.7)
+    """1280x720: sharp, colourful subject on the right, big high-contrast text on the left (typical high-CTR layout)."""
+    W, H = 1280, 720
+    src = Image.open(img_path).convert("RGB")
+    r = max(W / src.width, H / src.height)
+    bg = src.resize((int(src.width * r) + 1, int(src.height * r) + 1), Image.BILINEAR)
+    l, t = (bg.width - W) // 2, (bg.height - H) // 2
+    bg = ImageEnhance.Brightness(bg.crop((l, t, l + W, t + H)).filter(ImageFilter.GaussianBlur(22))).enhance(0.5)
+    side = min(src.width, src.height)
+    sq = src.crop(((src.width - side) // 2, (src.height - side) // 2, (src.width + side) // 2, (src.height + side) // 2))
+    fg = sq.resize((H, H), Image.LANCZOS)
+    fg = ImageEnhance.Color(ImageEnhance.Contrast(fg).enhance(1.18)).enhance(1.3).filter(ImageFilter.UnsharpMask(2, 80, 3))
+    ramp = (np.clip(np.arange(H) / 220.0, 0, 1) * 255).astype(np.uint8)
+    bg.paste(fg, (W - H, 0), Image.fromarray(np.tile(ramp, (H, 1)), "L"))
+    shade = (np.clip(1 - np.arange(W) / 780.0, 0, 1) ** 1.2 * 0.8).astype(np.float32)
+    arr = np.asarray(bg).astype(np.float32) * (1 - shade)[None, :, None]
+    img = ImageEnhance.Contrast(Image.fromarray(arr.astype(np.uint8))).enhance(1.08)
     d = ImageDraw.Draw(img)
-    lines, cur = [], ""
-    for w in text.split():
-        if len(cur) + len(w) > 14 and cur:
-            lines.append(cur); cur = w
-        else:
-            cur = (cur + " " + w).strip()
-    lines.append(cur)
-    size = 150 if len(lines) <= 2 else 115
-    f, y = _font(size), (720 - len(lines) * (size + 20)) // 2
-    for ln in lines:
-        d.text(((1280 - d.textlength(ln, font=f)) / 2, y), ln, font=f, fill="#FFE600", stroke_width=10, stroke_fill="black")
-        y += size + 20
-    img.save(out, "JPEG", quality=90)
+    size, _, lines = _thumb_layout(d, text, 640, int(H * 0.8))
+    lh = int(size * 1.3)
+    y = (H - lh * len(lines)) // 2
+    for i, ln in enumerate(lines):
+        col = "#FFFFFF" if i % 2 == 0 else "#FFD400"
+        _draw_runs(d, 55 + 6, y + 6, ln, size, "#000000", 10, "#000000")  # shadow
+        _draw_runs(d, 55, y, ln, size, col, 10, "#000000")
+        y += lh
+    for q in (92, 85, 78):
+        img.save(out, "JPEG", quality=q)
+        if os.path.getsize(out) < 1_900_000:  # YouTube limit is 2 MB
+            break
     return out
 
 
@@ -999,7 +1240,7 @@ def upload(yt, video, thumb, s, publish_at):
     if publish_at:
         status["publishAt"] = publish_at
     body = {"snippet": {"title": s["title"], "description": s["description"], "tags": s["tags"][:15],
-                        "categoryId": "27", "defaultLanguage": LANG, "defaultAudioLanguage": LANG}, "status": status}
+                        "categoryId": {"education": "27", "science_tech": "28", "entertainment": "24", "howto": "26"}.get(str(s.get("category")), "27"), "defaultLanguage": LANG, "defaultAudioLanguage": LANG}, "status": status}
     for attempt in (0, 1):
         try:
             req = yt.videos().insert(part="snippet,status", body=body,
@@ -1031,6 +1272,35 @@ def upload(yt, video, thumb, s, publish_at):
 
 
 # ---------------------------------------------------------------- main
+def _hms(t):
+    t = int(t)
+    return f"{t // 3600}:{t % 3600 // 60:02d}:{t % 60:02d}" if t >= 3600 else f"{t // 60}:{t % 60:02d}"
+
+
+def final_description(s, times):
+    """description + auto chapters (needs 0:00 first, >=3 chapters, >=10 s apart) + hashtags."""
+    parts = [s["description"]]
+    pts = {}
+    for c in s.get("chapters") or []:
+        try:
+            i, title = int(c["scene"]) - 1, str(c["title"]).strip()
+        except Exception:
+            continue
+        if 0 <= i < len(times) and title:
+            pts[round(times[i][0], 1)] = title
+    if pts:
+        pts[0.0] = pts.get(0.0) or pts[min(pts)]
+        last, lines = -99, []
+        for t in sorted(pts):
+            if t - last >= 10:
+                lines.append(f"{_hms(t)} {pts[t]}"); last = t
+        if len(lines) >= 3:
+            parts.append("\n".join(lines))
+    if s.get("_hashtags"):
+        parts.append(s["_hashtags"])
+    return "\n\n".join(parts)
+
+
 def make_one(yt, hist, stats, fmt, idx):
     print(f"=== Video {idx + 1}: {fmt} | best hour IST: {stats['best_hour']}")
     t = pick_topic(yt, stats, fmt, hist)
@@ -1039,11 +1309,15 @@ def make_one(yt, hist, stats, fmt, idx):
     work = f"work_{fmt}"
     os.makedirs(work, exist_ok=True)
     imgs = make_images(s, fmt, work)
-    times, caps = make_voice(s, work, 3 if fmt == "short" else 5)
+    times, caps = make_voice(s, work, 3 if fmt == "short" else 5, use_gemini=not QUICK)
     mix_audio(s, times, work)
     video = render(s, fmt, work, imgs, times, caps)
-    thumb = make_thumb(os.path.join(work, imgs[0]), s["thumb_text"], os.path.join(work, "thumb.jpg"))
-    slot = None if REVIEW else next_slot(stats["best_hour"], 3 * idx)
+    thumb_src = make_thumb_image(s, work)
+    thumb = make_thumb(os.path.join(work, thumb_src or imgs[0]), s.get("thumb_text") or s["title"], os.path.join(work, "thumb.jpg"))
+    s["description"] = final_description(s, times)
+    if QUICK:
+        s["title"] = "[TEST] " + s["title"][:85]
+    slot = None if (REVIEW or QUICK) else next_slot(stats["best_hour"], 3 * idx)
     vid = upload(yt, video, thumb, s, slot)
     print("Uploaded:", vid, "scheduled:", slot)
     hist.append(dict(date=dt.datetime.now(IST).date().isoformat(), topic=t["topic"], title=s["title"], fmt=fmt, id=vid, when=slot or "private"))
@@ -1060,7 +1334,16 @@ def main():
         return
     stats = analyze(yt)
     write_dashboard(stats, hist)
-    if (os.getenv("RUN_BOTH") or "").lower() == "true" or os.path.exists("run_both.txt"):
+    if cf_configured() and not ALLOW_FALLBACK:
+        cloudflare_image("a red apple on a table", steps=1)  # tiny check: is any account's free quota left?
+        if not cf_available():
+            print("Koi bhi Cloudflare account use nahi ho sakta (limit khatam ya token galat). Video nahi banega.")
+            print("Limit roz 5:30 AM IST pe reset hoti hai.")
+            sys.exit(1)
+    if QUICK:
+        plan = ["short"]  # quick test: one small Short, private
+        print("QUICK TEST MODE: 6 scenes, edge voice, private upload")
+    elif (os.getenv("RUN_BOTH") or "").lower() == "true" or os.path.exists("run_both.txt"):
         plan = ["short", "long"]  # test mode: short first (quick check), then long
     else:
         plan = [os.getenv("FORCE_FORMAT") or choose_format(stats)]
