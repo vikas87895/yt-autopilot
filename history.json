@@ -270,5 +270,21 @@
   "fmt": "short",
   "id": "wAe_ZDVG6UM",
   "when": "2026-11-25T13:30:00.000Z"
+ },
+ {
+  "date": "2026-11-26",
+  "topic": "Pangolin Scale Biomimicry: पैंगोलिन के स्केल्स से बना पेट के अंदर तैरने वाला रोबोट!",
+  "title": "Pangolin Robot: पैंगोलिन से बना पेट में तैरने वाला रोबोट?",
+  "fmt": "short",
+  "id": "f-u25Z_HxxM",
+  "when": "2026-11-26T13:30:00.000Z"
+ },
+ {
+  "date": "2026-11-26",
+  "topic": "Dolphin Sonar & Underwater Tsunami Early Warning System (डॉल्फिन की आवाज़ से बनी सुनामी की चेतावनी देने वाली तकनीक)",
+  "title": "Dolphin Sonar Tech: सुनामी की चेतावनी देने वाला सीक्रेट",
+  "fmt": "long",
+  "id": "aQ1Ete4M-4M",
+  "when": "2026-11-26T16:30:00.000Z"
  }
 ]
